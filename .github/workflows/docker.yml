@@ -116,13 +116,31 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Docker Hub 页面描述：内容源是 docs/dockerhub-readme.md，改了随时重跑本工作流即可
-      - name: 更新 Docker Hub 仓库描述（README）
+      # Docker Hub 页面描述：内容源是 docs/dockerhub-readme.md。
+      # 注意：Docker Hub 的 PAT 被官方禁止修改仓库描述（docker/hub-feedback#1927），
+      # 只有账号密码换出的 JWT 有权限。设了 DOCKERHUB_PASSWORD secret 才自动更新；
+      # 否则打印手动粘贴指引，不阻断构建。
+      - name: 更新 Docker Hub 仓库描述（README，可选）
         if: github.event_name != 'pull_request' && (github.event.inputs.push_to_dockerhub == 'true' || (github.event.inputs.push_to_dockerhub == null && env.DOCKERHUB_USERNAME != ''))
         env:
           DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          DH_PASSWORD: ${{ secrets.DOCKERHUB_PASSWORD }}
         run: |
+          if [ -z "$DH_PASSWORD" ]; then
+            echo "⚠️ 未配置 DOCKERHUB_PASSWORD，跳过描述自动更新（不影响镜像）"
+            echo "   Docker Hub 的 PAT 无法修改仓库描述（docker/hub-feedback#1927）"
+            echo "   手动更新：登录 hub.docker.com → $DH_USERNAME/yx-tools → Description，"
+            echo "   粘贴 docs/dockerhub-readme.md 的内容即可"
+            exit 0
+          fi
+          JWT=$(curl -sS -X POST https://hub.docker.com/v2/users/login/ \
+            -H 'Content-Type: application/json' \
+            -d "{\"username\":\"$DH_USERNAME\",\"password\":\"$DH_PASSWORD\"}" \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin).get("token",""))')
+          if [ -z "$JWT" ]; then
+            echo "⚠️ Docker Hub 登录失败（账号密码或 2FA 问题），跳过描述更新"
+            exit 0
+          fi
           BODY=$(python3 -c '
           import json
           desc = open("docs/dockerhub-readme.md", encoding="utf-8").read()
@@ -133,11 +151,11 @@ jobs:
           ')
           curl -fsS -X PATCH \
             -H "Content-Type: application/json" \
-            -H "Authorization: Bearer $DH_TOKEN" \
+            -H "Authorization: JWT $JWT" \
             -d "$BODY" \
-            "https://hub.docker.com/v2/repositories/$DH_USERNAME/yx-tools/"
-          echo ""
-          echo "✅ Docker Hub 描述已更新（docs/dockerhub-readme.md）"
+            "https://hub.docker.com/v2/repositories/$DH_USERNAME/yx-tools/" \
+            && echo "✅ Docker Hub 描述已更新（docs/dockerhub-readme.md）" \
+            || echo "⚠️ 描述更新失败（不影响镜像，可手动粘贴 docs/dockerhub-readme.md）"
 
       - name: 显示镜像信息
         if: github.event_name != 'pull_request'
