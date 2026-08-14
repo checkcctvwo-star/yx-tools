@@ -115,6 +115,12 @@ func (r *Runner) LastOptions() Options {
 
 // Start 启动一次测速；已有任务在跑时返回 false
 func (r *Runner) Start(o Options) bool {
+	return r.StartWithDone(o, nil)
+}
+
+// StartWithDone 启动一次测速，结束后（含出错、取消）回调 onDone。
+// onDone 在 final 事件广播之后执行，供调度器接着做上报。
+func (r *Runner) StartWithDone(o Options, onDone func([]Result, error)) bool {
 	r.mu.Lock()
 	if r.running {
 		r.mu.Unlock()
@@ -147,9 +153,15 @@ func (r *Runner) Start(o Options) bool {
 		if err != nil {
 			if ctx.Err() != nil {
 				r.broadcast(Event{Type: "error", Message: "已取消", Finished: true})
+				if onDone != nil {
+					onDone(nil, ctx.Err())
+				}
 				return
 			}
 			r.broadcast(Event{Type: "error", Message: err.Error(), Finished: true})
+			if onDone != nil {
+				onDone(nil, err)
+			}
 			return
 		}
 		r.mu.Lock()
@@ -159,8 +171,16 @@ func (r *Runner) Start(o Options) bool {
 			r.broadcast(Event{Type: "log", Message: "结果写入失败: " + err.Error()})
 		}
 		r.broadcast(Event{Type: "done", Message: "测速完成", Results: rs, Total: len(rs), Current: len(rs), Finished: true})
+		if onDone != nil {
+			onDone(rs, nil)
+		}
 	}()
 	return true
+}
+
+// Log 广播一条日志事件，供调度器把任务进度展示到界面
+func (r *Runner) Log(msg string) {
+	r.broadcast(Event{Type: "log", Message: msg})
 }
 
 // Cancel 取消当前任务

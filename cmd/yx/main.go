@@ -19,7 +19,7 @@ import (
 	"github.com/byJoey/yx-tools/internal/app"
 )
 
-var version = "3.0.0"
+var version = "3.1.0"
 
 const usage = `Cloudflare 优选 IP 测速工具 v%s
 

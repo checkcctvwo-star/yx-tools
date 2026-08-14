@@ -13,6 +13,9 @@ const state = {
   pool: 1000,      // 候选 IP 数量，0 表示不限
   httping: false,  // 用真实 HTTP 请求测延迟
   noDL: false,     // 跳过下载测速
+  schedules: [],   // 定时任务
+  proxyUrls: [],   // 优选反代的 URL 来源
+  editingSchedId: null,
 };
 
 // ── 提示 ──────────────────────────────────────────
@@ -206,8 +209,9 @@ function connectEvents() {
 }
 
 // ── 启动测速 ──────────────────────────────────────
-async function start() {
-  const opts = {
+// 把左侧面板当前设置翻译成一次测速的参数对象
+function collectOpts() {
+  return {
     colo: state.picked.join(','),
     ipv6: $('#segIPv button.on').dataset.v === '6',
     count: +$('#inCount').value || 10,
@@ -225,11 +229,14 @@ async function start() {
     dl_timeout: +$('#inDLTimeout').value || 10,
     max_runtime: +$('#inMaxRun').value || 0,
   };
+}
+
+async function start() {
   try {
     await api('/api/start', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(opts),
+      body: JSON.stringify(collectOpts()),
     });
     setRunning(true);
     $('#statusDot').className = 'dot run';
@@ -310,6 +317,7 @@ async function saveConfig() {
 function openProxy() {
   $('#proxyMask').classList.remove('hidden');
   updateProxyCount();
+  renderProxyUrls();
 }
 
 function updateProxyCount() {
@@ -320,16 +328,102 @@ function updateProxyCount() {
   $('#proxyCount').textContent = n ? n + ' 行' : '';
 }
 
-async function runProxy() {
-  const text = $('#proxyText').value.trim();
-  if (!text) { toast('先贴一份 IP 列表或 CSV', 'err'); return; }
-  if (state.running) { toast('正在测速，先停下来', 'err'); return; }
+// URL 来源行：一个输入框配一个删除按钮，最多 10 个
+function renderProxyUrls() {
+  const box = $('#proxyUrls');
+  box.innerHTML = '';
+  state.proxyUrls.forEach((u, i) => {
+    const row = document.createElement('div');
+    row.className = 'url-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'https://…/list.txt（每行一个 IP 或 IP:端口）';
+    input.value = u;
+    input.autocomplete = 'off';
+    input.addEventListener('input', () => { state.proxyUrls[i] = input.value.trim(); });
+    const del = document.createElement('button');
+    del.className = 'btn ghost sm';
+    del.type = 'button';
+    del.textContent = '×';
+    del.title = '删除这个链接';
+    del.onclick = () => { state.proxyUrls.splice(i, 1); renderProxyUrls(); };
+    row.appendChild(input);
+    row.appendChild(del);
+    box.appendChild(row);
+  });
+  $('#btnProxyAddUrl').classList.toggle('hidden', state.proxyUrls.length >= 10);
+}
+
+// 汇总当前弹窗里的来源，交给服务端合成
+function collectSources() {
+  return {
+    urls: state.proxyUrls.filter(u => u.trim() !== ''),
+    text: $('#proxyText').value.trim(),
+    random_cf: $('#proxyRandomCF').checked,
+    random_cf_count: +$('#proxyCFCount').value || 100,
+  };
+}
+
+function renderProxyPreview(r) {
+  const box = $('#proxyPreview');
+  box.classList.remove('hidden');
+  box.innerHTML = '';
+  const head = document.createElement('b');
+  head.textContent = `合并后共 ${r.count} 条`;
+  box.appendChild(head);
+  (r.sources || []).forEach(s => {
+    const el = document.createElement('div');
+    el.className = s.warning ? 'warn' : '';
+    el.textContent = `${s.name}：${s.warning || s.count + ' 条'}`;
+    box.appendChild(el);
+  });
+}
+
+// 预览合并：只统计，不写文件
+async function previewProxy() {
+  const src = collectSources();
+  if (!src.urls.length && !src.text && !src.random_cf) {
+    toast('先贴一份 IP 列表、填一个 URL，或勾选随机 CF', 'err');
+    return;
+  }
+  $('#btnProxyPreview').disabled = true;
   try {
-    const r = await api('/api/proxy-import', {
+    const r = await api('/api/proxy-fetch', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text, take: +$('#proxyTake').value || 0 }),
+      body: JSON.stringify({ ...src, port: +$('#inPort').value || 443, save: false }),
     });
+    renderProxyPreview(r);
+  } catch (e) {
+    const box = $('#proxyPreview');
+    box.classList.remove('hidden');
+    box.innerHTML = '';
+    const el = document.createElement('div');
+    el.className = 'warn';
+    el.textContent = e.message;
+    box.appendChild(el);
+  } finally {
+    $('#btnProxyPreview').disabled = false;
+  }
+}
+
+async function runProxy() {
+  const src = collectSources();
+  if (!src.urls.length && !src.text && !src.random_cf) {
+    toast('先贴一份 IP 列表、填一个 URL，或勾选随机 CF', 'err');
+    return;
+  }
+  if (state.running) { toast('正在测速，先停下来', 'err'); return; }
+  try {
+    const r = await api('/api/proxy-fetch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...src, port: +$('#inPort').value || 443,
+        save: true, take: +$('#proxyTake').value || 0,
+      }),
+    });
+    renderProxyPreview(r);
     toast(`已生成 ${r.file}，共 ${r.count} 条，开始测速`, 'ok');
     $('#proxyMask').classList.add('hidden');
     await api('/api/start', {
@@ -497,144 +591,235 @@ function importIPFile(file) {
 }
 
 // ── 定时任务 ──────────────────────────────────────
-async function loadCron() {
-  const box = $('#cronList');
+function fmtTime(ts) {
+  if (!ts) return '—';
+  const d = new Date(ts * 1000);
+  const p = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function fmtInterval(min) {
+  if (min % 1440 === 0) return `每 ${min / 1440} 天`;
+  if (min % 60 === 0) return `每 ${min / 60} 小时`;
+  return `每 ${min} 分钟`;
+}
+
+function schedTargets(t) {
+  const parts = [];
+  if (t.upload && t.upload.github) parts.push('GitHub');
+  if (t.upload && t.upload.worker) parts.push('Worker');
+  return parts.length ? parts.join(' + ') : '不上传';
+}
+
+async function loadSchedules() {
+  const box = $('#schedList');
   box.innerHTML = '';
   try {
-    const jobs = await api('/api/cron');
-    if (!jobs || !jobs.length) {
+    state.schedules = await api('/api/schedules') || [];
+    if (!state.schedules.length) {
       box.innerHTML = '<div class="empty" style="padding:14px">还没有定时任务</div>';
-      $('#cronHint').textContent = '';
+      $('#schedHint').textContent = '';
       return;
     }
-    $('#cronHint').textContent = jobs.length + ' 条';
-    jobs.forEach(j => {
-      const row = document.createElement('div');
-      row.className = 'cron-item';
-      const b = document.createElement('b');
-      b.textContent = j.schedule;
-      const sp = document.createElement('span');
-      sp.textContent = j.command;
-      sp.title = j.command;
-      row.appendChild(b);
-      row.appendChild(sp);
-      box.appendChild(row);
-    });
+    $('#schedHint').textContent = state.schedules.length + ' 条';
+    renderSchedules();
   } catch (e) {
-    box.innerHTML = '';
-    const d = document.createElement('div');
-    d.className = 'empty';
-    d.style.padding = '14px';
-    d.textContent = e.message;
-    box.appendChild(d);
+    box.innerHTML = '<div class="empty" style="padding:14px">' + e.message + '</div>';
   }
 }
 
-// 命令行里带空格的值要加引号，否则 crontab 会把它拆成两段
-function cronQuote(v) {
-  return /[\s"']/.test(v) ? "'" + String(v).replace(/'/g, "'\\''") + "'" : v;
+function renderSchedules() {
+  const box = $('#schedList');
+  box.innerHTML = '';
+  state.schedules.forEach(t => {
+    const item = document.createElement('div');
+    item.className = 'sched-item' + (t.enabled ? '' : ' off');
+
+    const row = document.createElement('div');
+    row.className = 'row';
+    const name = document.createElement('b');
+    name.textContent = t.name || '未命名';
+    const onoff = document.createElement('label');
+    onoff.className = 'check';
+    onoff.style.marginTop = '0';
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.checked = !!t.enabled;
+    cb.title = '启用 / 停用';
+    cb.onchange = () => toggleSched(t, cb.checked);
+    onoff.appendChild(cb);
+    onoff.appendChild(document.createTextNode('启用'));
+    row.appendChild(name);
+    row.appendChild(onoff);
+
+    const meta = document.createElement('div');
+    meta.className = 'meta';
+    meta.innerHTML = `<span>${fmtInterval(t.interval_minutes)}</span>` +
+      `<span>上次 ${fmtTime(t.last_run)}</span>` +
+      `<span>下次 ${fmtTime(t.next_run)}</span>` +
+      `<span>${schedTargets(t)}${t.upload && t.upload.top_n ? ' · 前 ' + t.upload.top_n : ''}</span>`;
+
+    const log = document.createElement('div');
+    log.className = 'log';
+    log.textContent = t.last_log || '还没有执行记录';
+
+    const act = document.createElement('div');
+    act.className = 'act';
+    const runBtn = document.createElement('button');
+    runBtn.className = 'btn ghost sm';
+    runBtn.textContent = '立即执行';
+    runBtn.onclick = () => runSchedNow(t);
+    const editBtn = document.createElement('button');
+    editBtn.className = 'btn ghost sm';
+    editBtn.textContent = '编辑';
+    editBtn.onclick = () => editSched(t);
+    const delBtn = document.createElement('button');
+    delBtn.className = 'btn ghost sm';
+    delBtn.textContent = '删除';
+    delBtn.onclick = () => delSched(t);
+    act.appendChild(runBtn);
+    act.appendChild(editBtn);
+    act.appendChild(delBtn);
+
+    item.appendChild(row);
+    item.appendChild(meta);
+    item.appendChild(log);
+    item.appendChild(act);
+    box.appendChild(item);
+  });
 }
 
-// 把当前界面上的选择翻译成一条等效的 CLI 命令，
-// 定时跑出来的结果才和手点「开始测速」一致。
-function buildCronArgs() {
-  const parts = ['test'];
-  const push = (flag, val) => { parts.push(flag, cronQuote(String(val))); };
-
-  if (state.picked.length) push('-colo', state.picked.join(','));
-  if ($('#segIPv button.on').dataset.v === '6') parts.push('-ipv6');
-  push('-n', +$('#inCount').value || 10);
-
-  const port = +$('#inPort').value || 443;
-  if (port !== 443) push('-port', port);
-
-  const sl = $('#inSpeed').value.trim();
-  if (sl !== '') push('-sl', sl);
-  const tl = +$('#inDelay').value;
-  if (tl > 0) push('-tl', tl);
-  const th = +$('#inThread').value;
-  if (th > 0 && th !== 200) push('-t', th);
-
-  // 候选数量：「全部」档是穷举，其余是抽样上限
-  if ($('#segPool button[data-pool="0"]').classList.contains('on')) {
-    parts.push('-all');
-  } else if (state.pool > 0) {
-    push('-c', state.pool);
-  }
-
-  if (state.httping) parts.push('-http');
-  if (state.noDL) parts.push('-nodl');
-
-  // 超时设置：非默认值才带上
-  const dt = +$('#inDLTimeout').value;
-  if (dt > 0 && dt !== 10) push('-dt', dt);
-  const mt = +$('#inMaxRun').value;
-  if (mt > 0) push('-mt', mt);
-
-  // 测速地址与默认值相同就不写了，命令太长反而看不清
-  const url = $('#inURL').value.trim();
-  if (url && url !== state.system.default_url) push('-url', url);
-
-  // 定时跑通常是为了自动上报，带上已填好的目标
-  const domain = $('#cfgDomain').value.trim();
-  const uuid = $('#cfgUUID').value.trim();
-  const repo = $('#cfgRepo').value.trim();
-  const limit = +$('#cfgLimit').value || 0;
-  if (domain && uuid) {
-    parts.push('-upload', 'api');
-    push('-domain', domain);
-    push('-uuid', uuid);
-    if (limit > 0) push('-limit', limit);
-    if ($('#cfgClear').checked) parts.push('-clear');
-  } else if (repo && state.hasToken) {
-    parts.push('-upload', 'github');
-    push('-repo', repo);
-    const path = $('#cfgPath').value.trim();
-    if (path) push('-path', path);
-    if (limit > 0) push('-limit', limit);
-  }
-  return parts.join(' ');
+function openSched() {
+  $('#schedMask').classList.remove('hidden');
+  closeSchedForm();
+  loadSchedules();
 }
 
-function openCron() {
-  if (!state.system.cron_supported) {
-    toast('当前系统没有 crontab，请用系统自带的计划任务', 'err');
-    return;
-  }
-  // 每次打开都按当前选择重新生成，除非用户手改过
-  if (!$('#cronArgs').dataset.edited) {
-    $('#cronArgs').value = buildCronArgs();
-  }
-  // 自定义 IP 段是界面里的文本，命令行只认文件，说清楚免得以为带上了
-  $('#cronArgsNote').textContent = $('#inIPText').value.trim()
-    ? '按左侧当前设置生成。自定义 IP 段没法写进命令，需要自己加 -f 文件路径'
-    : '按左侧当前设置生成，可以直接改';
-  $('#cronMask').classList.remove('hidden');
-  loadCron();
+function closeSchedForm() {
+  state.editingSchedId = null;
+  $('#schedForm').classList.add('hidden');
 }
 
-async function addCron() {
-  const schedule = $('#cronSchedule').value.trim();
-  // 文本域里可能有换行，crontab 一行只能放一条命令
-  const args = $('#cronArgs').value.replace(/\s+/g, ' ').trim();
-  if (!schedule) { toast('请选择或填写执行频率', 'err'); return; }
-  if (!args) { toast('请填写命令参数', 'err'); return; }
+// 来源与参数摘要：保存任务时按这个内容快照
+function srcSummary() {
+  const src = collectSources();
+  const parts = [];
+  if (src.urls.length) parts.push(`URL ${src.urls.length} 个`);
+  if (src.text) parts.push(`粘贴 ${src.text.split('\n').filter(l => l.trim()).length} 行`);
+  if (src.random_cf) parts.push(`随机 CF ${src.random_cf_count} 个`);
+  if (!parts.length) parts.push('空');
+  return parts.join(' + ');
+}
+
+function optsSummary() {
+  const o = collectOpts();
+  return [
+    o.colo ? '地区 ' + o.colo : '不限地区',
+    '数量 ' + o.count,
+    '端口 ' + o.port,
+    o.speed_limit ? '速度≥' + o.speed_limit + 'MB/s' : '不限速度',
+    o.httping ? '真实连接' : 'TCP 握手',
+    o.disable_dl ? '不测下载' : '测下载',
+  ].join(' · ');
+}
+
+function fillSchedForm(t) {
+  $('#schedName').value = (t && t.name) || '';
+  $('#schedMin').value = (t && t.interval_minutes) || 360;
+  markSchedPreset((t && t.interval_minutes) || 360);
+  $('#schedUploadGH').checked = t ? !!(t.upload && t.upload.github) : !!$('#cfgRepo').value.trim();
+  $('#schedUploadWorker').checked = t ? !!(t.upload && t.upload.worker) : !!($('#cfgDomain').value.trim() && $('#cfgUUID').value.trim());
+  $('#schedWorkerClear').checked = t ? !!(t.upload && t.upload.worker_clear) : true;
+  $('#schedTopN').value = (t && t.upload && t.upload.top_n) || 20;
+  $('#schedSrcHint').textContent = srcSummary();
+  $('#schedOptsHint').textContent = optsSummary();
+}
+
+function markSchedPreset(min) {
+  document.querySelectorAll('#schedPresets button').forEach(b =>
+    b.classList.toggle('on', +b.dataset.min === +min));
+}
+
+function newSched() {
+  state.editingSchedId = null;
+  fillSchedForm(null);
+  $('#schedForm').classList.remove('hidden');
+  $('#schedForm').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+function editSched(t) {
+  state.editingSchedId = t.id;
+  fillSchedForm(t);
+  $('#schedForm').classList.remove('hidden');
+  $('#schedForm').scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function saveSched() {
+  const name = $('#schedName').value.trim();
+  const min = +$('#schedMin').value;
+  if (!name) { toast('给任务起个名字', 'err'); return; }
+  if (!min || min < 1) { toast('执行频率至少 1 分钟', 'err'); return; }
+  const body = {
+    name,
+    enabled: true,
+    interval_minutes: min,
+    opts: collectOpts(),
+    sources: collectSources(),
+    upload: {
+      github: $('#schedUploadGH').checked,
+      worker: $('#schedUploadWorker').checked,
+      worker_clear: $('#schedWorkerClear').checked,
+      top_n: +$('#schedTopN').value || 0,
+    },
+  };
   try {
-    await api('/api/cron', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ schedule, args, replace: $('#cronReplace').checked }),
-    });
-    toast('定时任务已添加', 'ok');
-    loadCron();
+    if (state.editingSchedId) {
+      await api('/api/schedules/' + encodeURIComponent(state.editingSchedId), {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      toast('任务已更新', 'ok');
+    } else {
+      await api('/api/schedules', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      toast('任务已创建', 'ok');
+    }
+    closeSchedForm();
+    loadSchedules();
   } catch (e) { toast(e.message, 'err'); }
 }
 
-async function removeCron() {
+async function toggleSched(t, on) {
   try {
-    const r = await api('/api/cron', { method: 'DELETE' });
-    toast(r.count ? `已清掉 ${r.count} 条` : '没有本工具的任务', 'ok');
-    loadCron();
+    await api('/api/schedules/' + encodeURIComponent(t.id), {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...t, enabled: on }),
+    });
+    t.enabled = on;
+    renderSchedules();
+    toast(on ? '任务已启用' : '任务已停用', 'ok');
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function delSched(t) {
+  if (!confirm(`删除定时任务「${t.name}」？`)) return;
+  try {
+    await api('/api/schedules/' + encodeURIComponent(t.id), { method: 'DELETE' });
+    toast('已删除', 'ok');
+    loadSchedules();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+async function runSchedNow(t) {
+  try {
+    await api('/api/schedules/' + encodeURIComponent(t.id) + '/run', { method: 'POST' });
+    toast(`任务「${t.name}」已触发，稍等片刻可刷新查看日志`, 'ok');
+    setTimeout(loadSchedules, 2500);
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -700,6 +885,8 @@ async function removeCron() {
   $('#btnProxyClose').onclick = () => $('#proxyMask').classList.add('hidden');
   $('#proxyMask').onclick = e => { if (e.target === $('#proxyMask')) $('#proxyMask').classList.add('hidden'); };
   $('#btnProxyRun').onclick = runProxy;
+  $('#btnProxyPreview').onclick = previewProxy;
+  $('#btnProxyAddUrl').onclick = () => { state.proxyUrls.push(''); renderProxyUrls(); };
   $('#proxyText').addEventListener('input', updateProxyCount);
   $('#proxyFile').addEventListener('change', e => {
     const f = e.target.files && e.target.files[0];
@@ -723,35 +910,21 @@ async function removeCron() {
     e.target.value = '';
   });
 
-  $('#btnCron').onclick = openCron;
-  $('#btnCronClose').onclick = () => $('#cronMask').classList.add('hidden');
-  $('#cronMask').onclick = e => { if (e.target === $('#cronMask')) $('#cronMask').classList.add('hidden'); };
-  $('#btnCronAdd').onclick = addCron;
-  $('#cronArgs').addEventListener('input', e => {
-    e.target.dataset.edited = e.target.value.trim() ? '1' : '';
-    $('#btnCronSync').classList.toggle('hidden', !e.target.dataset.edited);
-  });
-  $('#btnCronSync').onclick = () => {
-    $('#cronArgs').value = buildCronArgs();
-    delete $('#cronArgs').dataset.edited;
-    $('#btnCronSync').classList.add('hidden');
-    toast('已按当前设置重新生成', 'ok');
-  };
-  $('#btnCronRemove').onclick = removeCron;
-  document.querySelectorAll('#cronPresets button').forEach(b => {
+  $('#btnCron').onclick = openSched;
+  $('#schedMask').onclick = e => { if (e.target === $('#schedMask')) $('#schedMask').classList.add('hidden'); };
+  $('#btnSchedNew').onclick = newSched;
+  $('#btnSchedCancel').onclick = closeSchedForm;
+  $('#btnSchedSave').onclick = saveSched;
+  $('#schedMin').addEventListener('input', e => markSchedPreset(e.target.value));
+  document.querySelectorAll('#schedPresets button').forEach(b => {
     b.onclick = () => {
-      document.querySelectorAll('#cronPresets button').forEach(x => x.classList.remove('on'));
+      document.querySelectorAll('#schedPresets button').forEach(x => x.classList.remove('on'));
       b.classList.add('on');
-      $('#cronSchedule').value = b.dataset.cron;
+      $('#schedMin').value = b.dataset.min;
     };
-  });
-  $('#cronSchedule').addEventListener('input', () => {
-    document.querySelectorAll('#cronPresets button').forEach(b =>
-      b.classList.toggle('on', b.dataset.cron === $('#cronSchedule').value.trim()));
   });
 
   try { state.system = await api('/api/system') || {}; } catch (_) {}
-  if (!state.system.cron_supported) $('#btnCron').classList.add('hidden');
 
   await loadConfig();
   try {

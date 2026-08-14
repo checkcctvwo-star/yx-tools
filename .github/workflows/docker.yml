@@ -56,7 +56,7 @@ jobs:
 
       # sha tag 只在推分支时带分支名前缀：tag 触发时 {{branch}} 为空，
       # 会生成 "-39355cf" 这种以 - 开头的非法 tag，导致整步失败
-      - name: 提取元数据（标签、摘要等）
+      - name: 提取元数据（GHCR 标签、摘要等）
         id: meta
         uses: docker/metadata-action@v5
         with:
@@ -75,7 +75,7 @@ jobs:
           flavor: |
             latest=auto
 
-      - name: 构建并推送 Docker 镜像（多架构）
+      - name: 构建并推送 Docker 镜像（GHCR，多架构）
         uses: docker/build-push-action@v5
         with:
           context: .
@@ -87,17 +87,46 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Docker Hub 需要单独的 metadata：用户名未配置时整个步骤跳过，
+      # 避免把空用户名拼进镜像名
+      - name: 提取元数据（Docker Hub 标签）
+        id: meta-dh
+        if: github.event_name != 'pull_request' && (github.event.inputs.push_to_dockerhub == 'true' || (github.event.inputs.push_to_dockerhub == null && env.DOCKERHUB_USERNAME != ''))
+        uses: docker/metadata-action@v5
+        with:
+          images: docker.io/${{ env.DOCKERHUB_USERNAME }}/yx-tools
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable={{is_default_branch}}
+          flavor: |
+            latest=auto
+
+      - name: 构建并推送 Docker 镜像（Docker Hub，多架构）
+        if: github.event_name != 'pull_request' && (github.event.inputs.push_to_dockerhub == 'true' || (github.event.inputs.push_to_dockerhub == null && env.DOCKERHUB_USERNAME != ''))
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta-dh.outputs.tags }}
+          labels: ${{ steps.meta-dh.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
       - name: 显示镜像信息
         if: github.event_name != 'pull_request'
         run: |
           echo "✅ Docker镜像构建完成！"
-          echo "📦 镜像标签:"
-          echo "${{ steps.meta.outputs.tags }}"
-          echo ""
-          echo "🔗 使用镜像:"
+          echo "📦 GHCR 镜像:"
           echo "  docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
           echo ""
           echo "🚀 运行容器:"
           echo "  docker run -d -p 8080:8080 \\"
           echo "    -v \$(pwd)/data:/data \\"
           echo "    ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+          echo ""
+          echo "🐳 Docker Hub 镜像（配置了 DOCKERHUB_USERNAME 时）:"
+          echo "  docker pull docker.io/${{ env.DOCKERHUB_USERNAME }}/yx-tools:latest"

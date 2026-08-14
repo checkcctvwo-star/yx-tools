@@ -238,7 +238,7 @@
     <em class="note">拿现成的 IP 列表来测：FOFA 导出的资产 CSV、别人分享的测速 CSV，或每行 IP:端口 的纯列表。CSV 只读 ip 和 port 两列，其他列不管</em>
     <div class="field">
       <label>IP 来源 <span class="hint" id="proxyCount"></span></label>
-      <textarea id="proxyText" rows="7" placeholder="104.20.18.132:443&#10;172.70.96.220:2053&#10;&#10;或直接粘贴带 ip,port 列的 CSV"></textarea>
+      <textarea id="proxyText" rows="6" placeholder="104.20.18.132:443&#10;172.70.96.220:2053&#10;&#10;或直接粘贴带 ip,port 列的 CSV"></textarea>
       <label class="filepick">
         <input type="file" id="proxyFile" accept=".txt,.csv,text/plain" hidden>
         <span class="btn ghost sm">
@@ -249,11 +249,28 @@
       </label>
     </div>
     <div class="field">
+      <label>从 URL 加载 <span class="hint">最多 10 个，每次执行前重新抓取</span></label>
+      <div id="proxyUrls"></div>
+      <button class="btn ghost sm" id="btnProxyAddUrl" type="button">+ 添加链接</button>
+      <em class="note">链接内容按行解析：IP 或 IP:端口，支持 # 注释；个别链接失败会跳过，在预览里提示</em>
+    </div>
+    <div class="field">
+      <label>随机 Cloudflare IP</label>
+      <label class="check"><input type="checkbox" id="proxyRandomCF"> 随机添加 Cloudflare 官方 IPv4 网段</label>
+      <div class="cfrow">
+        <input type="number" id="proxyCFCount" value="100" min="1" max="100000" title="随机生成的 IP 数量">
+        <em class="note">个，每轮重新随机，与上面的列表合并去重</em>
+      </div>
+    </div>
+    <div class="field">
       <label>取前 N 条 <span class="hint">留空全取</span></label>
       <input type="number" id="proxyTake" min="1" max="10000" placeholder="留空则全部">
     </div>
-    <em class="note">测的就是你给的这批 IP，不做抽样。左侧的地区、延迟测法、下载测速这些参数照常生效</em>
+    <div class="preview hidden" id="proxyPreview"></div>
+    <em class="note">测的就是合并后的这批 IP，不做抽样。左侧的地区、延迟测法、下载测速这些参数照常生效</em>
     <div class="modal-actions">
+      <button class="btn ghost" id="btnProxyPreview" type="button">预览合并</button>
+      <span class="spacer"></span>
       <button class="btn ghost" id="btnProxyClose">取消</button>
       <button class="btn primary" id="btnProxyRun">生成并测速</button>
     </div>
@@ -261,37 +278,58 @@
 </div>
 
 <!-- 定时任务弹窗 -->
-<div class="mask hidden" id="cronMask">
+<div class="mask hidden" id="schedMask">
   <div class="modal">
     <h3>定时任务</h3>
+    <em class="note">程序内置调度，Docker / NAS 也能用，重启后任务保留。到点自动测速并把结果按「优中选优」上传到 GitHub 与 Worker。</em>
     <div class="field">
-      <label>已有任务 <span class="hint" id="cronHint"></span></label>
-      <div class="cron-list" id="cronList"></div>
+      <label>已有任务 <span class="hint" id="schedHint"></span></label>
+      <div class="cron-list" id="schedList"></div>
+      <button class="btn ghost sm" id="btnSchedNew" type="button">+ 新建任务</button>
     </div>
-    <hr>
-    <div class="field">
-      <label>执行频率</label>
-      <div class="presets" id="cronPresets">
-        <button data-cron="0 */6 * * *">每 6 小时</button>
-        <button data-cron="0 */12 * * *">每 12 小时</button>
-        <button data-cron="0 4 * * *">每天 4 点</button>
-        <button data-cron="0 4 * * 1">每周一 4 点</button>
+
+    <div class="hidden" id="schedForm">
+      <hr>
+      <div class="field">
+        <label>任务名字</label>
+        <input type="text" id="schedName" placeholder="如：每 6 小时上报">
       </div>
-      <input type="text" id="cronSchedule" placeholder="0 */6 * * *" autocomplete="off">
-    </div>
-    <div class="field">
-      <label>执行的命令参数
-        <button class="btn ghost sm hidden" id="btnCronSync" title="按当前左侧设置重新生成">重新生成</button>
-      </label>
-      <textarea id="cronArgs" rows="3" placeholder="test -n 10 -sl 2" spellcheck="false"></textarea>
-      <em class="note" id="cronArgsNote">按左侧当前设置生成，可以直接改</em>
-    </div>
-    <label class="check"><input type="checkbox" id="cronReplace" checked> 添加前先清掉本工具已有的任务</label>
-    <div class="modal-actions">
-      <button class="btn ghost" id="btnCronRemove">清空任务</button>
-      <span class="spacer"></span>
-      <button class="btn ghost" id="btnCronClose">关闭</button>
-      <button class="btn primary" id="btnCronAdd">添加</button>
+      <div class="field">
+        <label>执行频率</label>
+        <div class="presets" id="schedPresets">
+          <button data-min="60">每 1 小时</button>
+          <button data-min="360" class="on">每 6 小时</button>
+          <button data-min="720">每 12 小时</button>
+          <button data-min="1440">每 24 小时</button>
+        </div>
+        <div class="cfrow">
+          <input type="number" id="schedMin" value="360" min="1" max="44640" title="间隔分钟数">
+          <em class="note">自定义分钟数（最小 1）</em>
+        </div>
+      </div>
+      <div class="field">
+        <label>上报目标</label>
+        <label class="check"><input type="checkbox" id="schedUploadGH"> 上传到 GitHub 仓库</label>
+        <label class="check"><input type="checkbox" id="schedUploadWorker"> 上报到 Worker</label>
+        <label class="check"><input type="checkbox" id="schedWorkerClear" checked> 上报 Worker 前清空已有 IP</label>
+      </div>
+      <div class="field">
+        <label>优中选优：每次上传前 N 个 <span class="hint">留空上传全部</span></label>
+        <input type="number" id="schedTopN" value="20" min="0" max="10000" placeholder="留空则全部">
+      </div>
+      <div class="field">
+        <label>候选来源 <span class="hint" id="schedSrcHint"></span></label>
+        <em class="note" id="schedSrcNote"></em>
+      </div>
+      <div class="field">
+        <label>测速参数 <span class="hint" id="schedOptsHint"></span></label>
+        <em class="note" id="schedOptsNote"></em>
+      </div>
+      <em class="note">来源与参数按「优选反代」弹窗和左侧面板的当前设置保存；之后改面板再保存一次即可更新。</em>
+      <div class="modal-actions">
+        <button class="btn ghost" id="btnSchedCancel" type="button">取消</button>
+        <button class="btn primary" id="btnSchedSave">保存任务</button>
+      </div>
     </div>
   </div>
 </div>

@@ -14,7 +14,9 @@ Cloudflare 优选 IP 测速工具。单个二进制，命令行和网页界面�
 - 测 Cloudflare 各数据中心的延迟和下载速度，支持 IPv4 / IPv6
 - 按机场码筛地区，全球 97 个数据中心
 - 反代模式：输入 `IP:端口`，结果保留端口信息
+- 优选反代来源支持：粘贴文本 / 文件导入 / 多个 URL 链接（每次执行前重新抓取，失败自动跳过）/ 随机混入 Cloudflare 官方 IPv4 网段
 - 一键上报到 [cfnew](https://github.com/byJoey/cfnew) 面板，或推到 GitHub 仓库
+- 内置定时任务：页面上配好频率与上报目标，到点自动测速并按「优中选优」取前 N 个上报，GitHub 与 Worker 可同时更新；Docker / NAS 里也能用，重启后任务保留
 - 网页界面实时看进度，也能纯命令行跑，适合塞进定时任务
 
 ## 装
@@ -104,12 +106,12 @@ docker compose up -d
 不想用 compose 就直接跑：
 
 ```bash
-docker run -d --name yx-tools -p 8080:8080 -v $PWD/data:/data ghcr.io/byjoey/yx-tools:latest
+docker run -d --name yx-tools -p 8080:8080 -v $PWD/data:/data ggshuai/yx-tools:latest
 ```
 
-换存放位置改环境变量 `YX_DATA_DIR` 即可。
-容器里没有可用的 cron，界面上的定时任务会自动隐藏 —— 定时跑请用宿主机的
-crontab 调 `docker exec`。
+镜像同时发布在 Docker Hub（`ggshuai/yx-tools`）和 GHCR（`ghcr.io/byJoey/yx-tools`），
+amd64 / arm64 都有。换存放位置改环境变量 `YX_DATA_DIR` 即可。
+内置定时任务在容器里照常工作，不需要宿主机 cron。
 
 ## 参数
 
@@ -151,7 +153,14 @@ crontab 调 `docker exec`。
 
 ## 定时任务
 
-Linux / macOS 直接用内置命令挂 cron，不用自己编辑 crontab：
+网页里点右上角的时钟按钮：新建任务，选频率（每 1/6/12/24 小时或自定义分钟数）、
+勾上报目标（GitHub / Worker 可同时勾）、填「优中选优」的前 N 数量，保存即生效。
+任务按保存时的页面设置运行（左侧参数 + 优选反代来源），改设置后重新保存一次即可更新。
+每个任务都能停用、编辑、删除、立即执行，并显示上次/下次执行时间与执行日志。
+
+内置调度在任何环境都能跑（包括 Docker / NAS），重启后任务保留在 `yx-config.json`。
+
+Linux / macOS 也保留了命令行挂 cron 的老方式：
 
 ```bash
 # 每 6 小时测一次并上报

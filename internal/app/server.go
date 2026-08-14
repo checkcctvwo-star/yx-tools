@@ -18,12 +18,15 @@ var webFS embed.FS
 // Server 提供 Web 图形界面与 REST 接口
 type Server struct {
 	runner *Runner
+	sched  *Scheduler
 	mux    *http.ServeMux
 }
 
 // NewServer 构造 Web 服务
 func NewServer() *Server {
 	s := &Server{runner: NewRunner(), mux: http.NewServeMux()}
+	s.sched = NewScheduler(s.runner)
+	s.sched.Start()
 	s.routes()
 	return s
 }
@@ -47,6 +50,13 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/download", s.handleDownload)
 	s.mux.HandleFunc("/api/system", s.handleSystem)
 	s.mux.HandleFunc("/api/proxy-import", s.handleProxyImport)
+	// 内置定时任务与候选来源合成
+	s.mux.HandleFunc("GET /api/schedules", s.handleSchedulesList)
+	s.mux.HandleFunc("POST /api/schedules", s.handleScheduleCreate)
+	s.mux.HandleFunc("PUT /api/schedules/{id}", s.handleScheduleUpdate)
+	s.mux.HandleFunc("DELETE /api/schedules/{id}", s.handleScheduleDelete)
+	s.mux.HandleFunc("POST /api/schedules/{id}/run", s.handleScheduleRun)
+	s.mux.HandleFunc("POST /api/proxy-fetch", s.handleProxyFetch)
 }
 
 // ServeHTTP 实现 http.Handler
@@ -92,7 +102,6 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"max_runtime":      c.MaxRunTime,
 		})
 	case http.MethodPost:
-		cur := LoadConfig()
 		var in struct {
 			WorkerDomain *string  `json:"worker_domain"`
 			UUID         *string  `json:"uuid"`
@@ -112,46 +121,48 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			writeErr(w, http.StatusBadRequest, "请求格式错误")
 			return
 		}
-		if in.WorkerDomain != nil {
-			cur.WorkerDomain = *in.WorkerDomain
-		}
-		if in.UUID != nil {
-			cur.UUID = *in.UUID
-		}
-		if in.GitHubToken != nil && *in.GitHubToken != "" {
-			cur.GitHubToken = *in.GitHubToken
-		}
-		if in.GitHubRepo != nil {
-			cur.GitHubRepo = *in.GitHubRepo
-		}
-		if in.GitHubPath != nil {
-			cur.GitHubPath = *in.GitHubPath
-		}
-		if in.Colo != nil {
-			cur.Colo = *in.Colo
-		}
-		if in.IPv6 != nil {
-			cur.IPv6 = *in.IPv6
-		}
-		if in.Count != nil {
-			cur.Count = *in.Count
-		}
-		if in.SpeedLimit != nil {
-			cur.SpeedLimit = *in.SpeedLimit
-		}
-		if in.DelayLimit != nil {
-			cur.DelayLimit = *in.DelayLimit
-		}
-		if in.Threads != nil {
-			cur.Threads = *in.Threads
-		}
-		if in.TestURL != nil {
-			cur.TestURL = *in.TestURL
-		}
-		if in.Port != nil {
-			cur.Port = *in.Port
-		}
-		if err := SaveConfig(cur); err != nil {
+		err := mutateConfig(func(cur *Config) {
+			if in.WorkerDomain != nil {
+				cur.WorkerDomain = *in.WorkerDomain
+			}
+			if in.UUID != nil {
+				cur.UUID = *in.UUID
+			}
+			if in.GitHubToken != nil && *in.GitHubToken != "" {
+				cur.GitHubToken = *in.GitHubToken
+			}
+			if in.GitHubRepo != nil {
+				cur.GitHubRepo = *in.GitHubRepo
+			}
+			if in.GitHubPath != nil {
+				cur.GitHubPath = *in.GitHubPath
+			}
+			if in.Colo != nil {
+				cur.Colo = *in.Colo
+			}
+			if in.IPv6 != nil {
+				cur.IPv6 = *in.IPv6
+			}
+			if in.Count != nil {
+				cur.Count = *in.Count
+			}
+			if in.SpeedLimit != nil {
+				cur.SpeedLimit = *in.SpeedLimit
+			}
+			if in.DelayLimit != nil {
+				cur.DelayLimit = *in.DelayLimit
+			}
+			if in.Threads != nil {
+				cur.Threads = *in.Threads
+			}
+			if in.TestURL != nil {
+				cur.TestURL = *in.TestURL
+			}
+			if in.Port != nil {
+				cur.Port = *in.Port
+			}
+		})
+		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
 			return
 		}
@@ -189,13 +200,13 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// 记住这次参数，下次打开界面自动回填
-	c := LoadConfig()
-	c.Colo, c.IPv6, c.Count = o.Colo, o.IPv6, o.Count
-	c.SpeedLimit, c.DelayLimit, c.Threads = o.SpeedLimit, o.DelayLimit, o.Threads
-	c.TestURL, c.Port = o.TestURL, o.Port
-	c.SampleSize, c.HTTPing, c.DisableDL = o.SampleSize, o.HTTPing, o.DisableDL
-	c.DLTimeout, c.MaxRunTime = o.DLTimeout, o.MaxRunTime
-	_ = SaveConfig(c)
+	_ = mutateConfig(func(c *Config) {
+		c.Colo, c.IPv6, c.Count = o.Colo, o.IPv6, o.Count
+		c.SpeedLimit, c.DelayLimit, c.Threads = o.SpeedLimit, o.DelayLimit, o.Threads
+		c.TestURL, c.Port = o.TestURL, o.Port
+		c.SampleSize, c.HTTPing, c.DisableDL = o.SampleSize, o.HTTPing, o.DisableDL
+		c.DLTimeout, c.MaxRunTime = o.DLTimeout, o.MaxRunTime
+	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -308,8 +319,7 @@ func (s *Server) handleUploadAPI(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	c.WorkerDomain, c.UUID = in.Domain, in.UUID
-	_ = SaveConfig(c)
+	_ = mutateConfig(func(c *Config) { c.WorkerDomain, c.UUID = in.Domain, in.UUID })
 	writeJSON(w, http.StatusOK, map[string]any{"count": n})
 }
 
@@ -345,8 +355,9 @@ func (s *Server) handleUploadGitHub(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
-	c.GitHubRepo, c.GitHubToken, c.GitHubPath = in.Repo, in.Token, in.Path
-	_ = SaveConfig(c)
+	_ = mutateConfig(func(c *Config) {
+		c.GitHubRepo, c.GitHubToken, c.GitHubPath = in.Repo, in.Token, in.Path
+	})
 	writeJSON(w, http.StatusOK, map[string]any{"count": n})
 }
 
@@ -470,4 +481,170 @@ func shellQuote(s string) string {
 		return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 	}
 	return s
+}
+
+// ── 内置定时任务 ──────────────────────────────────
+
+// handleSchedulesList 列出全部定时任务
+func (s *Server) handleSchedulesList(w http.ResponseWriter, r *http.Request) {
+	c := LoadConfig()
+	writeJSON(w, http.StatusOK, c.Schedules)
+}
+
+// handleScheduleCreate 新建任务：从当前面板复制参数，首次执行等一个周期
+func (s *Server) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
+	var in ScheduleTask
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if in.IntervalMin < 1 {
+		writeErr(w, http.StatusBadRequest, "执行频率至少 1 分钟")
+		return
+	}
+	in.ID = genID()
+	now := time.Now().Unix()
+	in.LastRun = 0
+	in.NextRun = now + int64(in.IntervalMin)*60
+	in.LastLog = fmt.Sprintf("%s 任务已创建", stamp())
+	var out ScheduleTask
+	err := mutateConfig(func(c *Config) {
+		c.Schedules = append(c.Schedules, in)
+		normalizeSchedule(&c.Schedules[len(c.Schedules)-1], len(c.Schedules)-1)
+		out = c.Schedules[len(c.Schedules)-1]
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleScheduleUpdate 整体覆盖一条任务；编辑后下次执行时间重新起算
+func (s *Server) handleScheduleUpdate(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	var in ScheduleTask
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if in.ID != "" && in.ID != id {
+		writeErr(w, http.StatusBadRequest, "任务 ID 不匹配")
+		return
+	}
+	if in.IntervalMin < 1 {
+		writeErr(w, http.StatusBadRequest, "执行频率至少 1 分钟")
+		return
+	}
+	var out ScheduleTask
+	found := false
+	err := mutateConfig(func(c *Config) {
+		for i := range c.Schedules {
+			if c.Schedules[i].ID != id {
+				continue
+			}
+			in.ID = id
+			in.LastRun = c.Schedules[i].LastRun // 编辑不抹掉执行历史
+			in.NextRun = time.Now().Unix() + int64(in.IntervalMin)*60
+			normalizeSchedule(&in, i)
+			c.Schedules[i] = in
+			out = in
+			found = true
+			break
+		}
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if !found {
+		writeErr(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// handleScheduleDelete 删除一条任务
+func (s *Server) handleScheduleDelete(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	removed := 0
+	err := mutateConfig(func(c *Config) {
+		kept := c.Schedules[:0]
+		for _, t := range c.Schedules {
+			if t.ID == id {
+				removed++
+				continue
+			}
+			kept = append(kept, t)
+		}
+		c.Schedules = kept
+	})
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if removed == 0 {
+		writeErr(w, http.StatusNotFound, "任务不存在")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleScheduleRun 立即执行一条任务；撞车时由调度器跳过并记日志
+func (s *Server) handleScheduleRun(w http.ResponseWriter, r *http.Request) {
+	id := r.PathValue("id")
+	if err := s.sched.RunNow(id); err != nil {
+		writeErr(w, http.StatusNotFound, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// handleProxyFetch 抓取 URL、合并文本与随机 CF，生成候选列表并预览统计。
+// save 为真时把合并结果写进 ips_ports.txt，供随后的反代测速使用。
+func (s *Server) handleProxyFetch(w http.ResponseWriter, r *http.Request) {
+	var in struct {
+		URLs          []string `json:"urls"`
+		Text          string   `json:"text"`
+		RandomCF      bool     `json:"random_cf"`
+		RandomCFCount int      `json:"random_cf_count"`
+		Port          int      `json:"port"`
+		Take          int      `json:"take"`
+		Save          bool     `json:"save"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求格式错误")
+		return
+	}
+	if len(in.URLs) > 10 {
+		writeErr(w, http.StatusBadRequest, "最多填 10 个 URL")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 3*time.Minute)
+	defer cancel()
+	items, stats, err := BuildCandidateSources(ctx, ScheduleSources{
+		URLs: in.URLs, Text: in.Text,
+		RandomCF: in.RandomCF, RandomCFCount: in.RandomCFCount,
+	}, in.Port)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error": err.Error(), "sources": stats,
+		})
+		return
+	}
+	if in.Save {
+		if _, err := WriteProxyList(ProxyListFile, items, in.Take); err != nil {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+	n := len(items)
+	if in.Take > 0 && in.Take < n {
+		n = in.Take
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"count":   n,
+		"file":    ProxyListFile,
+		"sources": stats,
+	})
 }
