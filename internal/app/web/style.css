@@ -196,3 +196,20 @@ em.note{font-style:normal;font-size:11.5px;color:var(--faint);line-height:1.45;
   .toolbar input{max-width:none;width:100%}
   .actions{margin-top:10px}
 }
+
+/* 分地区配额与固定列表 */
+.quota-presets{display:flex;flex-wrap:wrap;gap:6px}
+.quota-chip{display:flex;align-items:center;gap:6px;background:var(--panel2);
+  border:1px solid var(--line);border-radius:6px;padding:4px 8px;font-size:12px}
+.quota-chip b{font-weight:600}
+.quota-chip input{width:52px}
+.quota-chip .del{background:none;border:0;color:var(--faint);cursor:pointer;font-size:13px}
+.quota-manual{margin-top:6px;display:flex;flex-wrap:wrap;gap:6px}
+.fixed-list,.times{display:flex;flex-direction:column;gap:6px}
+.fixed-row{display:flex;gap:6px;align-items:center}
+.fixed-row input[name=faddr]{flex:1.4;min-width:0}
+.fixed-row input[name=fname]{flex:1;min-width:0}
+.fixed-row .del{background:none;border:0;color:var(--faint);cursor:pointer;font-size:14px}
+.time-row{display:flex;gap:6px;align-items:center}
+.time-row input{width:86px;font-family:var(--mono)}
+.time-row .del{background:none;border:0;color:var(--faint);cursor:pointer;font-size:14px}

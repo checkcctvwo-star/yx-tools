@@ -16,6 +16,10 @@ const state = {
   schedules: [],   // 定时任务
   proxyUrls: [],   // 优选反代的 URL 来源
   editingSchedId: null,
+  quotas: [],      // 分地区上传配额（预设 + 手动）
+  fixedItems: [],  // 固定附带列表
+  schedMode: 'interval', // 定时任务时间模式
+  schedTimes: [],  // 每天固定时刻 HH:MM 列表
 };
 
 // ── 提示 ──────────────────────────────────────────
@@ -171,8 +175,28 @@ function setProgress(cur, total) {
   return null;
 }
 
+// 向后端核对真实运行状态，校准开始/停止按钮。
+// SSE 断线重连后回放可能漏掉终态事件，这里兜底，避免按钮永远卡在「停止」。
+async function statusSync() {
+  try {
+    const st = await api('/api/status');
+    if (state.running !== !!st.running) {
+      if (!st.running) {
+        // 服务端已停但本页还停在「测速中」：把结果补全
+        try {
+          const rs = await api('/api/results');
+          if (Array.isArray(rs) && rs.length) { state.results = rs; renderTable(); }
+        } catch (_) {}
+      }
+      setRunning(!!st.running);
+      if (!st.running) $('#statusDot').className = 'dot';
+    }
+  } catch (_) {}
+}
+
 function connectEvents() {
   const es = new EventSource('/api/events');
+  window.__eventSource = es; // 供测试/调试关闭连接，验证状态轮询兜底
   es.onmessage = ev => {
     let e;
     try { e = JSON.parse(ev.data); } catch (_) { return; }
@@ -205,7 +229,10 @@ function connectEvents() {
       setRunning(true, true);
     }
   };
-  es.onerror = () => { /* 浏览器会自动重连 */ };
+  // SSE 断线会自动重连；重连后回放可能丢终态，这里立即校准一次
+  es.onerror = () => setTimeout(statusSync, 800);
+  // 每 5 秒轮询一次，避免界面状态与服务端永久脱节
+  setInterval(statusSync, 5000);
 }
 
 // ── 启动测速 ──────────────────────────────────────
@@ -224,11 +251,20 @@ function collectOpts() {
     sample_size: state.pool,
     // 只有点了「全部」这一档才穷举网段内每个 IP
     test_all: $('#segPool button[data-pool="0"]').classList.contains('on'),
+    download_all: $('#segDLAll button.on').dataset.dlall === '1',
     httping: state.httping,
     disable_dl: state.noDL,
     dl_timeout: +$('#inDLTimeout').value || 10,
     max_runtime: +$('#inMaxRun').value || 0,
   };
+}
+
+function setDLAll(on) {
+  document.querySelectorAll('#segDLAll button').forEach(b =>
+    b.classList.toggle('on', (b.dataset.dlall === '1') === on));
+  $('#dlAllNote').textContent = on
+    ? '候选全部下载测完再按速度取前 N，结果更稳但会慢很多'
+    : '凑够数量就收工；「全部测完」更准但很慢';
 }
 
 async function start() {
@@ -261,6 +297,12 @@ async function loadConfig(uploadOnly) {
     $('#cfgPath').value = c.github_path || 'cloudflare_ips.txt';
     state.hasToken = !!c.has_github_token;
     $('#tokenHint').textContent = state.hasToken ? '已保存' : '';
+    state.quotas = (c.region_quotas || []).map(q => ({ name: q.name, colos: q.colos || [], count: q.count || 0 }));
+    state.fixedItems = (c.fixed_items || []).map(f => ({ addr: f.addr, name: f.name }));
+    $('#inOtherQuota').value = c.other_quota || 0;
+    $('#quotaFill').checked = !!c.quota_fill;
+    renderQuotas();
+    renderFixed();
     if (uploadOnly) return;
     // 回填上次的测速参数
     if (c.count) $('#inCount').value = c.count;
@@ -273,6 +315,7 @@ async function loadConfig(uploadOnly) {
     if (c.max_runtime != null) $('#inMaxRun').value = c.max_runtime;
     setPing(!!c.httping);
     setDL(!!c.disable_dl);
+    setDLAll(!!c.download_all);
     if (c.sample_size != null) {
       const custom = !POOL_PRESETS.includes(c.sample_size);
       if (custom) $('#inPool').value = c.sample_size;
@@ -295,6 +338,7 @@ async function saveConfig() {
     uuid: $('#cfgUUID').value.trim(),
     github_repo: $('#cfgRepo').value.trim(),
     github_path: $('#cfgPath').value.trim(),
+    ...collectConfigExtra(),
   };
   const tok = $('#cfgToken').value.trim();
   if (tok) body.github_token = tok;
@@ -312,6 +356,150 @@ async function saveConfig() {
 }
 
 // ── 导出与上报 ────────────────────────────────────
+// ── 分地区配额与固定附带列表 ──────────────────────
+const PRESET_QUOTAS = [
+  { name: '吉隆坡', colos: ['KUL'] },
+  { name: '新加坡', colos: ['SIN'] },
+  { name: '香港', colos: ['HKG'] },
+  { name: '日本', colos: ['NRT', 'KIX', 'ITM', 'FUK'] },
+  { name: '台北', colos: ['TPE'] },
+];
+
+// 预设地区 + 手动地区合并成最终配额行（保持预设顺序）
+function allQuotas() {
+  const manual = state.quotas.filter(q => !PRESET_QUOTAS.some(p =>
+    p.name === q.name && p.colos.join(',') === q.colos.join(',')));
+  return PRESET_QUOTAS.map(p => {
+    const hit = state.quotas.find(q => q.name === p.name && q.colos.join(',') === p.colos.join(','));
+    return { name: p.name, colos: p.colos, count: hit ? hit.count : 0 };
+  }).concat(manual);
+}
+
+// 渲染配置弹窗里的地区配额（预设 + 手动）
+function renderQuotas() {
+  const box = $('#quotaPresets');
+  box.innerHTML = '';
+  allQuotas().forEach((q, i) => {
+    const manual = PRESET_QUOTAS.some(p => p.name === q.name && p.colos.join(',') === q.colos.join(','));
+    const el = document.createElement('div');
+    el.className = 'quota-chip';
+    const label = document.createElement('b');
+    label.textContent = q.name;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.max = '1000';
+    input.value = q.count || '';
+    input.placeholder = '0';
+    input.title = q.colos.join(', ');
+    input.addEventListener('input', () => {
+      const v = +input.value || 0;
+      if (manual) {
+        const idx = state.quotas.findIndex(x => x.name === q.name && x.colos.join(',') === q.colos.join(','));
+        if (idx >= 0) state.quotas[idx].count = v;
+        else state.quotas.push({ name: q.name, colos: q.colos, count: v });
+      } else {
+        q.count = v; // allQuotas() 里手动地区是 state.quotas 的引用
+      }
+    });
+    el.appendChild(label);
+    el.appendChild(input);
+    if (!manual) {
+      const del = document.createElement('button');
+      del.className = 'del';
+      del.textContent = '×';
+      del.title = '删除这个地区';
+      del.onclick = () => {
+        state.quotas = state.quotas.filter(x => !(x.name === q.name && x.colos.join(',') === q.colos.join(',')));
+        renderQuotas();
+      };
+      el.appendChild(del);
+    }
+    box.appendChild(el);
+  });
+  // 手动行
+  const mbox = $('#quotaManual');
+  mbox.innerHTML = '';
+  state.quotas.forEach((q, i) => {
+    if (PRESET_QUOTAS.some(p => p.name === q.name && p.colos.join(',') === q.colos.join(','))) return;
+    const el = document.createElement('div');
+    el.className = 'quota-chip';
+    const label = document.createElement('b');
+    label.textContent = q.name;
+    const input = document.createElement('input');
+    input.type = 'number';
+    input.min = '0';
+    input.max = '1000';
+    input.value = q.count || '';
+    input.addEventListener('input', () => { state.quotas[i].count = +input.value || 0; });
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '×';
+    del.onclick = () => { state.quotas.splice(i, 1); renderQuotas(); };
+    el.appendChild(label); el.appendChild(input); el.appendChild(del);
+    mbox.appendChild(el);
+  });
+}
+
+// 手动机场码：已有则跳到它的输入框，否则新增一行
+function addManualQuota() {
+  const code = $('#inQuotaCode').value.trim().toUpperCase();
+  if (!code) { toast('先输入机场码，如 LAX', 'err'); return; }
+  // 多个机场码用逗号分隔，方便一次加多个
+  const codes = code.split(',').map(s => s.trim()).filter(Boolean);
+  codes.forEach(c => {
+    if (!state.quotas.some(q => q.colos.includes(c))) {
+      state.quotas.push({ name: c, colos: [c], count: 0 });
+    }
+  });
+  $('#inQuotaCode').value = '';
+  renderQuotas();
+}
+
+function renderFixed() {
+  const box = $('#fixedList');
+  box.innerHTML = '';
+  if (!state.fixedItems.length) {
+    const empty = document.createElement('div');
+    empty.className = 'empty';
+    empty.textContent = '还没有固定条目';
+    box.appendChild(empty);
+  }
+  state.fixedItems.forEach((f, i) => {
+    const row = document.createElement('div');
+    row.className = 'fixed-row';
+    const addr = document.createElement('input');
+    addr.type = 'text';
+    addr.name = 'faddr';
+    addr.placeholder = 'IP 或域名（可带端口）';
+    addr.value = f.addr;
+    addr.addEventListener('input', () => { state.fixedItems[i].addr = addr.value.trim(); });
+    const name = document.createElement('input');
+    name.type = 'text';
+    name.name = 'fname';
+    name.placeholder = '名字';
+    name.value = f.name;
+    name.addEventListener('input', () => { state.fixedItems[i].name = name.value.trim(); });
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '×';
+    del.title = '删除这条';
+    del.onclick = () => { state.fixedItems.splice(i, 1); renderFixed(); };
+    row.appendChild(addr); row.appendChild(name); row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+
+// 收集配额与固定列表，随配置一起保存
+function collectConfigExtra() {
+  const quotas = allQuotas().filter(q => q.count > 0).map(q => ({ name: q.name, colos: q.colos, count: q.count }));
+  return {
+    region_quotas: quotas,
+    other_quota: +$('#inOtherQuota').value || 0,
+    quota_fill: $('#quotaFill').checked,
+    fixed_items: state.fixedItems.filter(f => f.addr),
+  };
+}
 // ── 优选反代 ──────────────────────────────────────
 // 拿现成的 IP 列表当输入源重测一遍，沿用旧 Python 版的流程。
 function openProxy() {
@@ -466,6 +654,7 @@ async function uploadAPI() {
       }),
     });
     toast(`已上报 ${r.count} 个 IP`, 'ok');
+    (r.warnings || []).forEach(w => toast(w, 'err'));
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -488,6 +677,7 @@ async function uploadGitHub() {
       }),
     });
     toast(`已上传 ${r.count} 个 IP 到 GitHub`, 'ok');
+    (r.warnings || []).forEach(w => toast(w, 'err'));
   } catch (e) { toast(e.message, 'err'); }
 }
 
@@ -604,6 +794,14 @@ function fmtInterval(min) {
   return `每 ${min} 分钟`;
 }
 
+// 任务的时间表达：每天固定时刻或间隔
+function fmtSchedule(t) {
+  if (t.mode === 'daily' && (t.times || []).length) {
+    return '每天 ' + t.times.join('、');
+  }
+  return fmtInterval(t.interval_minutes);
+}
+
 function schedTargets(t) {
   const parts = [];
   if (t.upload && t.upload.github) parts.push('GitHub');
@@ -654,7 +852,7 @@ function renderSchedules() {
 
     const meta = document.createElement('div');
     meta.className = 'meta';
-    meta.innerHTML = `<span>${fmtInterval(t.interval_minutes)}</span>` +
+    meta.innerHTML = `<span>${fmtSchedule(t)}</span>` +
       `<span>上次 ${fmtTime(t.last_run)}</span>` +
       `<span>下次 ${fmtTime(t.next_run)}</span>` +
       `<span>${schedTargets(t)}${t.upload && t.upload.top_n ? ' · 前 ' + t.upload.top_n : ''}</span>`;
@@ -725,6 +923,10 @@ function optsSummary() {
 
 function fillSchedForm(t) {
   $('#schedName').value = (t && t.name) || '';
+  const mode = (t && t.mode) || 'interval';
+  setSchedMode(mode);
+  state.schedTimes = (t && mode === 'daily' && t.times) ? t.times.slice() : ['08:00'];
+  renderSchedTimes();
   $('#schedMin').value = (t && t.interval_minutes) || 360;
   markSchedPreset((t && t.interval_minutes) || 360);
   $('#schedUploadGH').checked = t ? !!(t.upload && t.upload.github) : !!$('#cfgRepo').value.trim();
@@ -733,6 +935,50 @@ function fillSchedForm(t) {
   $('#schedTopN').value = (t && t.upload && t.upload.top_n) || 20;
   $('#schedSrcHint').textContent = srcSummary();
   $('#schedOptsHint').textContent = optsSummary();
+}
+
+// 切换定时任务的时间模式并显示对应表单块
+function setSchedMode(mode) {
+  state.schedMode = mode;
+  document.querySelectorAll('#schedMode button').forEach(b =>
+    b.classList.toggle('on', b.dataset.mode === mode));
+  $('#schedInterval').classList.toggle('hidden', mode !== 'interval');
+  $('#schedDaily').classList.toggle('hidden', mode !== 'daily');
+  if (mode === 'daily') refreshServerTime();
+}
+
+async function refreshServerTime() {
+  try {
+    const s = await api('/api/system');
+    $('#schedServerTime').textContent = `${s.server_time_text}（${s.server_tz}）`;
+  } catch (_) {}
+}
+
+function renderSchedTimes() {
+  const box = $('#schedTimes');
+  box.innerHTML = '';
+  state.schedTimes.forEach((t, i) => {
+    const row = document.createElement('div');
+    row.className = 'time-row';
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.placeholder = 'HH:MM';
+    input.value = t;
+    input.maxlength = '5';
+    input.addEventListener('input', () => { state.schedTimes[i] = input.value.trim(); });
+    const del = document.createElement('button');
+    del.className = 'del';
+    del.textContent = '×';
+    del.title = '删除这个时刻';
+    del.onclick = () => { state.schedTimes.splice(i, 1); renderSchedTimes(); };
+    row.appendChild(input); row.appendChild(del);
+    box.appendChild(row);
+  });
+}
+
+function addSchedTime() {
+  state.schedTimes.push('');
+  renderSchedTimes();
 }
 
 function markSchedPreset(min) {
@@ -756,13 +1002,21 @@ function editSched(t) {
 
 async function saveSched() {
   const name = $('#schedName').value.trim();
-  const min = +$('#schedMin').value;
   if (!name) { toast('给任务起个名字', 'err'); return; }
-  if (!min || min < 1) { toast('执行频率至少 1 分钟', 'err'); return; }
+  const invalid = /^([01]\d|2[0-3]):[0-5]\d$/;
+  if (state.schedMode === 'daily') {
+    if (!state.schedTimes.length) { toast('固定时刻至少填一个', 'err'); return; }
+    const bad = state.schedTimes.filter(t => !invalid.test(t));
+    if (bad.length) { toast('时刻格式应为 HH:MM，如 08:30', 'err'); return; }
+  }
+  const min = +$('#schedMin').value || 360;
+  if (state.schedMode !== 'daily' && min < 1) { toast('执行频率至少 1 分钟', 'err'); return; }
   const body = {
     name,
     enabled: true,
+    mode: state.schedMode,
     interval_minutes: min,
+    times: state.schedMode === 'daily' ? state.schedTimes.slice() : [],
     opts: collectOpts(),
     sources: collectSources(),
     upload: {
@@ -853,13 +1107,19 @@ async function runSchedNow(t) {
   document.querySelectorAll('#segDL button').forEach(b => {
     b.onclick = () => setDL(b.dataset.dl === 'off');
   });
+  document.querySelectorAll('#segDLAll button').forEach(b => {
+    b.onclick = () => setDLAll(b.dataset.dlall === '1');
+  });
   $('#inPool').addEventListener('input', e => {
     const v = +e.target.value;
     setPool(v > 0 ? v : 0, { custom: true });
   });
   $('#inIPText').addEventListener('input', syncPoolNote);
   $('#btnStart').onclick = start;
-  $('#btnStop').onclick = () => api('/api/cancel', { method: 'POST' }).catch(() => {});
+  $('#btnStop').onclick = () => {
+    api('/api/cancel', { method: 'POST' }).catch(() => {});
+    setTimeout(statusSync, 1500); // 停止后校准按钮，避免停在「停止」态
+  };
   $('#filterText').addEventListener('input', renderTable);
 
   document.querySelectorAll('thead th[data-sort]').forEach(th => {
@@ -910,6 +1170,9 @@ async function runSchedNow(t) {
     e.target.value = '';
   });
 
+  $('#btnQuotaAddCode').onclick = addManualQuota;
+  $('#btnFixedAdd').onclick = () => { state.fixedItems.push({ addr: '', name: '' }); renderFixed(); };
+
   $('#btnCron').onclick = openSched;
   $('#schedMask').onclick = e => { if (e.target === $('#schedMask')) $('#schedMask').classList.add('hidden'); };
   $('#btnSchedNew').onclick = newSched;
@@ -923,6 +1186,10 @@ async function runSchedNow(t) {
       $('#schedMin').value = b.dataset.min;
     };
   });
+  document.querySelectorAll('#schedMode button').forEach(b => {
+    b.onclick = () => setSchedMode(b.dataset.mode);
+  });
+  $('#btnSchedAddTime').onclick = addSchedTime;
 
   try { state.system = await api('/api/system') || {}; } catch (_) {}
 

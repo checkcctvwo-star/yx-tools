@@ -40,24 +40,25 @@ const (
 
 // Options 是一次测速任务的输入参数
 type Options struct {
-	Colo       string  `json:"colo"`        // 机场码筛选，多个用逗号分隔，空表示不限
-	IPv6       bool    `json:"ipv6"`        // 使用 IPv6 段
-	Count      int     `json:"count"`       // 下载测速数量
-	SpeedLimit float64 `json:"speed_limit"` // 下载速度下限 MB/s
-	DelayLimit int     `json:"delay_limit"` // 平均延迟上限 ms
-	Threads    int     `json:"threads"`     // 延迟测速线程数
-	Port       int     `json:"port"`        // 测速端口
-	TestURL    string  `json:"test_url"`    // 下载测速地址
-	IPFile     string  `json:"ip_file"`     // 自定义 IP 文件；为空则按 IPv6 选项自动下载
-	IPText     string  `json:"ip_text"`     // 直接指定 IP 段，优先于 IPFile
-	SampleSize int     `json:"sample_size"` // 参与延迟测速的候选 IP 数量，0 表示不限
-	Proxy      bool    `json:"proxy"`       // 反代模式：直接测给定的 IP:端口 列表
-	HTTPing    bool    `json:"httping"`     // 用真实 HTTP 请求测延迟（含 TLS 与服务端响应）
-	DisableDL  bool    `json:"disable_dl"`  // 只测延迟，跳过下载测速
-	TestAll    bool    `json:"test_all"`    // 测速全部 IP
-	DLTimeout  int     `json:"dl_timeout"`  // 单个 IP 的下载测速时长上限，秒
-	MaxRunTime int     `json:"max_runtime"` // 整个任务的时长上限，秒，0 表示不限
-	Verbose    bool    `json:"-"`           // 是否让测速内核输出自己的进度条
+	Colo        string  `json:"colo"`         // 机场码筛选，多个用逗号分隔，空表示不限
+	IPv6        bool    `json:"ipv6"`         // 使用 IPv6 段
+	Count       int     `json:"count"`        // 下载测速数量
+	SpeedLimit  float64 `json:"speed_limit"`  // 下载速度下限 MB/s
+	DelayLimit  int     `json:"delay_limit"`  // 平均延迟上限 ms
+	Threads     int     `json:"threads"`      // 延迟测速线程数
+	Port        int     `json:"port"`         // 测速端口
+	TestURL     string  `json:"test_url"`     // 下载测速地址
+	IPFile      string  `json:"ip_file"`      // 自定义 IP 文件；为空则按 IPv6 选项自动下载
+	IPText      string  `json:"ip_text"`      // 直接指定 IP 段，优先于 IPFile
+	SampleSize  int     `json:"sample_size"`  // 参与延迟测速的候选 IP 数量，0 表示不限
+	Proxy       bool    `json:"proxy"`        // 反代模式：直接测给定的 IP:端口 列表
+	HTTPing     bool    `json:"httping"`      // 用真实 HTTP 请求测延迟（含 TLS 与服务端响应）
+	DisableDL   bool    `json:"disable_dl"`   // 只测延迟，跳过下载测速
+	TestAll     bool    `json:"test_all"`     // 测速全部 IP
+	DownloadAll bool    `json:"download_all"` // 下载阶段全部测完再按速度取前 N
+	DLTimeout   int     `json:"dl_timeout"`   // 单个 IP 的下载测速时长上限，秒
+	MaxRunTime  int     `json:"max_runtime"`  // 整个任务的时长上限，秒，0 表示不限
+	Verbose     bool    `json:"-"`            // 是否让测速内核输出自己的进度条
 }
 
 // Result 是单条测速结果
@@ -71,6 +72,7 @@ type Result struct {
 	Speed    float64 `json:"speed"`
 	Colo     string  `json:"colo"`
 	ColoName string  `json:"colo_name"`
+	Fixed    bool    `json:"fixed,omitempty"` // 固定附带条目（不参与测速）
 }
 
 // Progress 描述测速进度，供界面实时展示
@@ -189,6 +191,7 @@ func Run(ctx context.Context, o Options, report func(Progress)) (rs []Result, er
 	task.MinSpeed = o.SpeedLimit
 	task.Timeout = time.Duration(o.DLTimeout) * time.Second
 	task.Disable = o.DisableDL
+	task.DownloadAll = o.DownloadAll
 	task.TestAll = o.TestAll
 	task.SampleSize = o.SampleSize
 	task.IPFile = ipFile

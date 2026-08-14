@@ -19,7 +19,7 @@ import (
 	"github.com/byJoey/yx-tools/internal/app"
 )
 
-var version = "3.1.0"
+var version = "3.2.0"
 
 const usage = `Cloudflare 优选 IP 测速工具 v%s
 
@@ -43,6 +43,7 @@ const usage = `Cloudflare 优选 IP 测速工具 v%s
   -f      自定义 IP 文件（支持 IP:端口 每行一条）；留空自动用 Cloudflare 官方 IP 段
   -c      参与延迟测速的候选 IP 数量，从官方段里随机抽（默认 0 不限，约 6000 个）
   -all    穷举每个网段的全部 IP（很慢，会忽略 -c）
+  -dall   下载阶段全部测完再按速度取前 N，而不是凑够就停（很慢）
   -http   用真实 HTTP 请求测延迟（含 TLS 握手与服务端响应），比 TCP 握手准
   -nodl   只测延迟，跳过下载测速
   -dt     单个 IP 的下载测速时长上限，秒（默认 10）
@@ -212,6 +213,7 @@ func runTest(args []string) {
 	testAll := fs.Bool("all", false, "穷举全部 IP")
 	httping := fs.Bool("http", false, "用真实 HTTP 请求测延迟")
 	noDL := fs.Bool("nodl", false, "只测延迟")
+	dall := fs.Bool("dall", false, "下载阶段全部测完再挑前 N")
 	dlTimeout := fs.Int("dt", 10, "单个 IP 的下载测速时长上限（秒）")
 	maxRun := fs.Int("mt", 0, "整轮测速的时长上限（秒），0 不限")
 	out := fs.String("o", app.ResultFile, "结果输出文件")
@@ -223,7 +225,7 @@ func runTest(args []string) {
 		SpeedLimit: *speed, DelayLimit: *delay, Threads: *threads,
 		Port: *port, TestURL: *url, IPFile: *ipFile, DisableDL: *noDL,
 		SampleSize: *sample, TestAll: *testAll, HTTPing: *httping,
-		DLTimeout: *dlTimeout, MaxRunTime: *maxRun,
+		DownloadAll: *dall, DLTimeout: *dlTimeout, MaxRunTime: *maxRun,
 		Verbose: true,
 	}
 
@@ -274,7 +276,17 @@ func doUpload(ctx context.Context, uf uploadFlags, rs []app.Result) {
 	if mode == "" || mode == "none" {
 		return
 	}
+	// 命令行上传也沿用量化与固定附带列表（只有全局配额，没有分地区配额）
 	cfg := app.LoadConfig()
+	plan := app.UploadPlan{Limit: *uf.limit, Fixed: cfg.FixedItems}
+	rs, warns := app.BuildUploadList(rs, plan)
+	for _, w := range warns {
+		fmt.Fprintf(os.Stderr, "提示: %s\n", w)
+	}
+	if len(rs) == 0 {
+		fmt.Fprintln(os.Stderr, "没有可上传的结果")
+		os.Exit(1)
+	}
 	switch mode {
 	case "api":
 		d, u := *uf.domain, *uf.uuid
@@ -284,7 +296,7 @@ func doUpload(ctx context.Context, uf uploadFlags, rs []app.Result) {
 		if u == "" {
 			u = cfg.UUID
 		}
-		n, err := app.UploadToAPI(ctx, app.APITarget{Domain: d, UUID: u}, rs, *uf.limit, *uf.clear)
+		n, err := app.UploadToAPI(ctx, app.APITarget{Domain: d, UUID: u}, rs, 0, *uf.clear)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "上报失败: %v\n", err)
 			os.Exit(1)
@@ -303,7 +315,7 @@ func doUpload(ctx context.Context, uf uploadFlags, rs []app.Result) {
 		if path == "" {
 			path = cfg.GitHubPath
 		}
-		n, err := app.UploadToGitHub(ctx, app.GitHubTarget{Repo: repo, Token: token, Path: path}, rs, *uf.limit)
+		n, err := app.UploadToGitHub(ctx, app.GitHubTarget{Repo: repo, Token: token, Path: path}, rs, 0)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "上传失败: %v\n", err)
 			os.Exit(1)

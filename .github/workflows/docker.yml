@@ -116,6 +116,29 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # Docker Hub 页面描述：内容源是 docs/dockerhub-readme.md，改了随时重跑本工作流即可
+      - name: 更新 Docker Hub 仓库描述（README）
+        if: github.event_name != 'pull_request' && (github.event.inputs.push_to_dockerhub == 'true' || (github.event.inputs.push_to_dockerhub == null && env.DOCKERHUB_USERNAME != ''))
+        env:
+          DH_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DH_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          BODY=$(python3 -c '
+          import json
+          desc = open("docs/dockerhub-readme.md", encoding="utf-8").read()
+          print(json.dumps({
+            "short_description": "Cloudflare 优选 IP 测速工具（内置网页界面与定时任务）",
+            "full_description": desc
+          }))
+          ')
+          curl -fsS -X PATCH \
+            -H "Content-Type: application/json" \
+            -H "Authorization: Bearer $DH_TOKEN" \
+            -d "$BODY" \
+            "https://hub.docker.com/v2/repositories/$DH_USERNAME/yx-tools/"
+          echo ""
+          echo "✅ Docker Hub 描述已更新（docs/dockerhub-readme.md）"
+
       - name: 显示镜像信息
         if: github.event_name != 'pull_request'
         run: |

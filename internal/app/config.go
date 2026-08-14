@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 )
@@ -18,22 +19,55 @@ type Config struct {
 	GitHubPath   string `json:"github_path"`
 
 	// 上次使用的测速参数，供界面回填
-	Colo       string  `json:"colo"`
-	IPv6       bool    `json:"ipv6"`
-	Count      int     `json:"count"`
-	SpeedLimit float64 `json:"speed_limit"`
-	DelayLimit int     `json:"delay_limit"`
-	Threads    int     `json:"threads"`
-	TestURL    string  `json:"test_url"`
-	Port       int     `json:"port"`
-	SampleSize int     `json:"sample_size"`
-	HTTPing    bool    `json:"httping"`
-	DisableDL  bool    `json:"disable_dl"`
-	DLTimeout  int     `json:"dl_timeout"`
-	MaxRunTime int     `json:"max_runtime"`
+	Colo        string  `json:"colo"`
+	IPv6        bool    `json:"ipv6"`
+	Count       int     `json:"count"`
+	SpeedLimit  float64 `json:"speed_limit"`
+	DelayLimit  int     `json:"delay_limit"`
+	Threads     int     `json:"threads"`
+	TestURL     string  `json:"test_url"`
+	Port        int     `json:"port"`
+	SampleSize  int     `json:"sample_size"`
+	HTTPing     bool    `json:"httping"`
+	DisableDL   bool    `json:"disable_dl"`
+	DLTimeout   int     `json:"dl_timeout"`
+	MaxRunTime  int     `json:"max_runtime"`
+	DownloadAll bool    `json:"download_all"` // 下载阶段全部测完再按速度取前 N
 
 	// 内置定时任务（Docker 等没有 crontab 的环境也靠它）
 	Schedules []ScheduleTask `json:"schedules"`
+
+	// 分地区上传配额与固定附带列表（全局，手动与定时上传共用）
+	RegionQuotas []RegionQuota `json:"region_quotas"`
+	OtherQuota   int           `json:"other_quota"` // 「其他地区」上传数量，0 表示不额外传
+	QuotaFill    bool          `json:"quota_fill"`  // 地区不足时用其他地区补位
+	FixedItems   []FixedItem   `json:"fixed_items"` // 每次上传都必定附带的 IP/域名
+}
+
+// RegionQuota 一个地区的上传配额：结果机场码命中 Colos 里任何一个就算该地区
+type RegionQuota struct {
+	Name  string   `json:"name"`
+	Colos []string `json:"colos"`
+	Count int      `json:"count"` // 0 表示未配置该地区
+}
+
+// ColoHit 判断结果机场码是否属于该配额地区
+func (q RegionQuota) ColoHit(colo string) bool {
+	if colo == "" || len(q.Colos) == 0 {
+		return false
+	}
+	for _, c := range q.Colos {
+		if strings.EqualFold(c, colo) {
+			return true
+		}
+	}
+	return false
+}
+
+// FixedItem 每次上传都固定附带的条目；Addr 为 IP、IP:端口、域名或 域名:端口
+type FixedItem struct {
+	Addr string `json:"addr"`
+	Name string `json:"name"`
 }
 
 // ScheduleSources 定时任务的候选 IP 来源：
@@ -51,6 +85,11 @@ type ScheduleUpload struct {
 	Worker      bool `json:"worker"`       // 上报到 cfnew Worker
 	TopN        int  `json:"top_n"`        // 优中选优，取前 N 个，0 表示全部
 	WorkerClear bool `json:"worker_clear"` // 上报前清空 Worker 已有 IP
+
+	// 分地区上传配额快照；配了配额就以配额总量为准，忽略 TopN
+	Quotas     []RegionQuota `json:"quotas"`
+	OtherQuota int           `json:"other_quota"`
+	QuotaFill  bool          `json:"quota_fill"`
 }
 
 // ScheduleTask 是一条内置定时任务：到点测速并按设置上报
@@ -58,7 +97,9 @@ type ScheduleTask struct {
 	ID          string          `json:"id"`
 	Name        string          `json:"name"`
 	Enabled     bool            `json:"enabled"`
+	Mode        string          `json:"mode"` // "daily" 每天固定时刻；其他值/缺省为间隔模式
 	IntervalMin int             `json:"interval_minutes"`
+	Times       []string        `json:"times"`    // daily 模式的 HH:MM 列表
 	LastRun     int64           `json:"last_run"` // Unix 秒，0 表示没跑过
 	NextRun     int64           `json:"next_run"` // Unix 秒，0 表示到期立即补跑
 	LastLog     string          `json:"last_log"`
@@ -169,6 +210,44 @@ func normalizeSchedule(t *ScheduleTask, idx int) {
 	if strings.TrimSpace(t.Name) == "" {
 		t.Name = fmt.Sprintf("任务 %d", idx+1)
 	}
+	if t.Mode == "daily" {
+		t.Times = validTimePoints(t.Times)
+		if len(t.Times) == 0 {
+			t.Times = []string{"08:00"}
+		}
+	}
+}
+
+// parseTimePoint 解析 HH:MM，返回小时与分钟
+func parseTimePoint(s string) (hh, mm int, ok bool) {
+	parts := strings.Split(strings.TrimSpace(s), ":")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	hh, err1 := strconv.Atoi(parts[0])
+	mm, err2 := strconv.Atoi(parts[1])
+	if err1 != nil || err2 != nil || hh < 0 || hh > 23 || mm < 0 || mm > 59 {
+		return 0, 0, false
+	}
+	return hh, mm, true
+}
+
+// validTimePoints 过滤出合法的时间点，统一格式化为 HH:MM 并去重
+func validTimePoints(times []string) []string {
+	out := make([]string, 0, len(times))
+	seen := map[string]bool{}
+	for _, t := range times {
+		hh, mm, ok := parseTimePoint(t)
+		if !ok {
+			continue
+		}
+		norm := fmt.Sprintf("%02d:%02d", hh, mm)
+		if !seen[norm] {
+			out = append(out, norm)
+			seen[norm] = true
+		}
+	}
+	return out
 }
 
 // SaveConfig 覆盖写入配置

@@ -2,6 +2,7 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -136,11 +137,11 @@ func TestSchedulerRunAndUploads(t *testing.T) {
 	if !fe.started[0].Proxy {
 		t.Error("定时测速应以反代模式跑合并列表")
 	}
-	if len(ghRS) != 25 || ghTopN != 20 {
-		t.Errorf("GitHub 上报应收到全部结果与前 N 限制: %d/%d", len(ghRS), ghTopN)
+	if len(ghRS) != 20 || ghTopN != 0 {
+		t.Errorf("GitHub 上报应收到装配后的前 N 结果（limit 已由装配层处理）: %d/%d", len(ghRS), ghTopN)
 	}
-	if len(apiRS) != 25 || !apiClear {
-		t.Errorf("Worker 上报应收到全部结果且带清空标记: %d/%v", len(apiRS), apiClear)
+	if len(apiRS) != 20 || !apiClear {
+		t.Errorf("Worker 上报应收到装配后的前 N 结果且带清空标记: %d/%v", len(apiRS), apiClear)
 	}
 
 	got := reloadConfigForTest(t)
@@ -183,7 +184,84 @@ func TestSchedulerSourceFailureLogs(t *testing.T) {
 	}
 }
 
-// CheckDue 只处理启用且到期的任务
+// nextRun：interval 模式往后推一个周期
+func TestNextRunInterval(t *testing.T) {
+	task := &ScheduleTask{Mode: "", IntervalMin: 60}
+	now := time.Date(2025, 1, 1, 10, 0, 0, 0, time.Local)
+	got := nextRun(task, now)
+	want := now.Add(60 * time.Minute).Unix()
+	if got != want {
+		t.Fatalf("interval nextRun=%d, want %d", got, want)
+	}
+}
+
+// nextRun：daily 模式取当天/明天最早且严格晚于 now 的时刻
+func TestNextRunDaily(t *testing.T) {
+	loc := time.FixedZone("T", 8*3600) // UTC+8，避免依赖运行机时区
+	task := &ScheduleTask{Mode: "daily", Times: []string{"08:30", "20:15"}}
+
+	// 上午 10 点：今天的 20:15 是下一次
+	now := time.Date(2025, 1, 1, 10, 0, 0, 0, loc)
+	got := nextRun(task, now)
+	want := time.Date(2025, 1, 1, 20, 15, 0, 0, loc).Unix()
+	if got != want {
+		t.Fatalf("同日较早时刻: got %d, want %d", got, want)
+	}
+
+	// 晚上 21 点：跳到明天 08:30
+	now = time.Date(2025, 1, 1, 21, 0, 0, 0, loc)
+	got = nextRun(task, now)
+	want = time.Date(2025, 1, 2, 8, 30, 0, 0, loc).Unix()
+	if got != want {
+		t.Fatalf("跨天回绕: got %d, want %d", got, want)
+	}
+
+	// 正好 08:30：严格晚于 now，应跳到明天
+	now = time.Date(2025, 1, 1, 8, 30, 0, 0, loc)
+	got = nextRun(task, now)
+	want = time.Date(2025, 1, 1, 20, 15, 0, 0, loc).Unix()
+	if got != want {
+		t.Fatalf("恰好命中时刻应严格晚于 now: got %d, want %d", got, want)
+	}
+}
+
+// daily 模式 Time 全非法时回退 interval 兜底
+func TestNextRunDailyBadTimes(t *testing.T) {
+	task := &ScheduleTask{Mode: "daily", Times: []string{"99:99", "abc"}, IntervalMin: 360}
+	now := time.Date(2025, 1, 1, 10, 0, 0, 0, time.Local)
+	if got := nextRun(task, now); got != now.Add(360*time.Minute).Unix() {
+		t.Fatalf("非法时刻应走 interval 兜底: got %d", got)
+	}
+}
+
+// validTimePoints 过滤非法时间点、统一格式化为 HH:MM 并去重
+func TestValidTimePoints(t *testing.T) {
+	in := []string{"08:00", "24:00", "08:00", "9:5", "23:59", "abc"}
+	got := validTimePoints(in)
+	want := []string{"08:00", "09:05", "23:59"}
+	if len(got) != len(want) {
+		t.Fatalf("validTimePoints=%v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("validTimePoints=%v, want %v", got, want)
+		}
+	}
+}
+
+// makeResults 生成 n 条测速结果，速度递减、地区分布方便测配额
+func makeColoResults(n int, colos []string) []Result {
+	out := make([]Result, 0, n)
+	for i := 0; i < n; i++ {
+		colo := colos[i%len(colos)]
+		out = append(out, Result{
+			IP:   fmt.Sprintf("1.1.%d.%d", i/250, i%250+1),
+			Port: 443,
+			Colo: colo,
+		})
+	}
+	return out
+}
 func TestCheckDueOnlyDueEnabled(t *testing.T) {
 	resetConfigForTest(t)
 	fe := &fakeExec{running: true} // 忙，让到期任务走跳过分支

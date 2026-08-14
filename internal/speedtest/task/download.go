@@ -31,6 +31,10 @@ var (
 
 	TestCount = defaultTestNum
 	MinSpeed  = defaultMinSpeed
+
+	// DownloadAll 为真时下载测速不再「凑够即停」：所有通过延迟筛选的
+	// IP 都下载测速完，再由上层统一按速度取前 N。
+	DownloadAll bool
 )
 
 // OnSpeedResult 在每个 IP 下载测速完成后调用，让界面能逐条出结果，
@@ -57,6 +61,16 @@ func checkDownloadDefault() {
 	}
 }
 
+// downloadQueue 返回等待下载测速的队列长度。
+// 凑够即停（all=false）：候选不足或设了速度下限就全测，否则只测前 TestCount 个；
+// 全部测完（all=true）：候选有多少测多少，达不达标由上层统一筛选。
+func downloadQueue(total, testCount int, minSpeed float64, all bool) int {
+	if all || minSpeed > 0 || total < testCount {
+		return total
+	}
+	return testCount
+}
+
 func TestDownloadSpeed(ipSet utils.PingDelaySet) (speedSet utils.DownloadSpeedSet) {
 	checkDownloadDefault()
 	if Disable {
@@ -66,11 +80,8 @@ func TestDownloadSpeed(ipSet utils.PingDelaySet) (speedSet utils.DownloadSpeedSe
 		utils.Yellow.Println("[信息] 延迟测速结果 IP 数量为 0，跳过下载测速。")
 		return
 	}
-	testNum := TestCount                        // 等待下载测速的队列数量 先默认等于 下载测速数量(-dn）
-	if len(ipSet) < TestCount || MinSpeed > 0 { // 如果延迟测速并过滤后的 IP 数组长度(IP数量) 小于 下载测速数量(-dn），（即 -dn 预期数量是不够的），或者指定了 下载测速下限 (-sl) 条件（这就可能要全部下载测速一遍，直到找齐预期数量或测完为止），则 等待下载测速的队列数量 修正为 IP 数量
-		testNum = len(ipSet)
-	}
-	if testNum < TestCount { // 如果 等待下载测速的队列数量 小于 下载测速数量(-dn），（显然 -dn 预期数量是不够的），所以 下载测速数量(-dn）修正为 等待下载测速的队列数量
+	testNum := downloadQueue(len(ipSet), TestCount, MinSpeed, DownloadAll) // 等待下载测速的队列数量
+	if testNum < TestCount {                                               // 如果 等待下载测速的队列数量 小于 下载测速数量(-dn），（显然 -dn 预期数量是不够的），所以 下载测速数量(-dn）修正为 等待下载测速的队列数量
 		TestCount = testNum
 	}
 
@@ -101,8 +112,8 @@ func TestDownloadSpeed(ipSet utils.PingDelaySet) (speedSet utils.DownloadSpeedSe
 		// 在每个 IP 下载测速后，以 [下载速度下限] 条件过滤结果
 		if speed >= MinSpeed*1024*1024 {
 			bar.Grow(1, "")
-			speedSet = append(speedSet, ipSet[i]) // 高于下载速度下限时，添加到新数组中
-			if len(speedSet) == TestCount {       // 凑够满足条件的 IP 时（下载测速数量 -dn），就跳出循环
+			speedSet = append(speedSet, ipSet[i])           // 高于下载速度下限时，添加到新数组中
+			if len(speedSet) == TestCount && !DownloadAll { // 凑够满足条件的 IP 时（下载测速数量 -dn），就跳出循环
 				break
 			}
 		}

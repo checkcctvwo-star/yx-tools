@@ -95,6 +95,15 @@
     </div>
 
     <div class="field">
+      <label>下载策略</label>
+      <div class="seg" id="segDLAll">
+        <button class="on" data-dlall="0">测够了就停</button>
+        <button data-dlall="1">全部测完再挑</button>
+      </div>
+      <em class="note" id="dlAllNote">凑够数量就收工；「全部测完」更准但很慢</em>
+    </div>
+
+    <div class="field">
       <label>延迟测速线程 <span class="hint" id="threadVal">200</span></label>
       <input type="range" id="inThread" min="10" max="1000" step="10" value="200">
     </div>
@@ -224,6 +233,32 @@
       <input type="number" id="cfgLimit" placeholder="留空上传全部" min="1" max="1000">
     </div>
     <label class="check"><input type="checkbox" id="cfgClear" checked> 上报前清空 Worker 已有 IP</label>
+
+    <hr>
+    <div class="field">
+      <label>分地区上传数量 <span class="hint">配了地区数量后「上报数量」不再生效</span></label>
+      <div class="quota-presets" id="quotaPresets"></div>
+      <div class="quota-manual" id="quotaManual"></div>
+      <div class="cfrow">
+        <input type="text" id="inQuotaCode" placeholder="手动机场码，如 LAX、NRT" autocomplete="off">
+        <button class="btn ghost sm" id="btnQuotaAddCode" type="button">+ 添加</button>
+      </div>
+      <div class="cfrow">
+        <label>其他地区数量</label>
+        <input type="number" id="inOtherQuota" placeholder="0 表示不传" min="0" max="1000">
+      </div>
+      <label class="check"><input type="checkbox" id="quotaFill"> 地区不足时用其他地区补位</label>
+      <em class="note">测速建议用「真实连接」测法，否则结果拿不到地区信息，分不了地区。</em>
+    </div>
+
+    <hr>
+    <div class="field">
+      <label>固定附带列表 <span class="hint">每次上传必定附带，不参与测速</span></label>
+      <div class="fixed-list" id="fixedList"></div>
+      <button class="btn ghost sm" id="btnFixedAdd" type="button">+ 添加条目</button>
+      <em class="note">每行：IP 或域名（可带端口）+ 名字，如 1.2.3.4:2053 家宽中转</em>
+    </div>
+
     <div class="modal-actions">
       <button class="btn ghost" id="btnCfgClose">取消</button>
       <button class="btn primary" id="btnCfgSave">保存</button>
@@ -292,19 +327,30 @@
       <hr>
       <div class="field">
         <label>任务名字</label>
-        <input type="text" id="schedName" placeholder="如：每 6 小时上报">
+        <input type="text" id="schedName" placeholder="如：每天 8 点上报">
       </div>
       <div class="field">
-        <label>执行频率</label>
-        <div class="presets" id="schedPresets">
-          <button data-min="60">每 1 小时</button>
-          <button data-min="360" class="on">每 6 小时</button>
-          <button data-min="720">每 12 小时</button>
-          <button data-min="1440">每 24 小时</button>
+        <label>执行时间</label>
+        <div class="seg" id="schedMode">
+          <button class="on" data-mode="interval">间隔</button>
+          <button data-mode="daily">每天固定时刻</button>
         </div>
-        <div class="cfrow">
-          <input type="number" id="schedMin" value="360" min="1" max="44640" title="间隔分钟数">
-          <em class="note">自定义分钟数（最小 1）</em>
+        <div id="schedInterval">
+          <div class="presets" id="schedPresets">
+            <button data-min="60">每 1 小时</button>
+            <button data-min="360" class="on">每 6 小时</button>
+            <button data-min="720">每 12 小时</button>
+            <button data-min="1440">每 24 小时</button>
+          </div>
+          <div class="cfrow">
+            <input type="number" id="schedMin" value="360" min="1" max="44640" title="间隔分钟数">
+            <em class="note">自定义分钟数（最小 1）</em>
+          </div>
+        </div>
+        <div id="schedDaily" class="hidden">
+          <div class="times" id="schedTimes"></div>
+          <button class="btn ghost sm" id="btnSchedAddTime" type="button">+ 添加时刻</button>
+          <em class="note">24 小时制，一天可多个时刻；服务器当前时间 <b id="schedServerTime">—</b></em>
         </div>
       </div>
       <div class="field">

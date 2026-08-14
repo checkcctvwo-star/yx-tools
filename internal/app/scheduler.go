@@ -59,6 +59,33 @@ func (s *Scheduler) Start() {
 // Stop 停止后台循环；幂等
 func (s *Scheduler) Stop() { s.stopOnce.Do(func() { close(s.stop) }) }
 
+// nextRun 计算一条任务的下一次执行时间（Unix 秒）。
+// interval 模式：从现在起往后推一个周期；
+// daily 模式：今天/明天所有 Times 里最早一个严格晚于 now 的时刻，按服务器本地时钟计算。
+func nextRun(t *ScheduleTask, now time.Time) int64 {
+	if t.Mode != "daily" {
+		return now.Add(time.Duration(t.IntervalMin) * time.Minute).Unix()
+	}
+	var best time.Time
+	for _, s := range t.Times {
+		hh, mm, ok := parseTimePoint(s)
+		if !ok {
+			continue
+		}
+		cand := time.Date(now.Year(), now.Month(), now.Day(), hh, mm, 0, 0, now.Location())
+		if !cand.After(now) {
+			cand = cand.AddDate(0, 0, 1)
+		}
+		if best.IsZero() || cand.Before(best) {
+			best = cand
+		}
+	}
+	if best.IsZero() { // 配置里没有合法时间点（normalize 兜底后一般到不了这里）
+		return now.Add(time.Duration(t.IntervalMin) * time.Minute).Unix()
+	}
+	return best.Unix()
+}
+
 // CheckDue 跑一遍到期任务；同时只会有一个执行入口（互斥锁兜底）
 func (s *Scheduler) CheckDue() {
 	s.mu.Lock()
@@ -141,6 +168,29 @@ func (s *Scheduler) finishRun(t *ScheduleTask, rs []Result, runErr error) {
 	} else if len(rs) == 0 {
 		lines = append(lines, fmt.Sprintf("%s 测速完成，但没有任何结果，跳过上报", stamp()))
 	} else {
+		// 装配：按任务快照的地区配额筛选，固定附带列表取自全局配置
+		plan := UploadPlan{
+			Quotas:     t.Upload.Quotas,
+			OtherQuota: t.Upload.OtherQuota,
+			QuotaFill:  t.Upload.QuotaFill,
+			Fixed:      cfg.FixedItems,
+			Limit:      t.Upload.TopN,
+		}
+		rs, warns := BuildUploadList(rs, plan)
+		for _, w := range warns {
+			s.exec.Log(fmt.Sprintf("定时任务「%s」：%s", t.Name, w))
+			lines = append(lines, fmt.Sprintf("%s %s", stamp(), w))
+		}
+		if len(rs) == 0 {
+			lines = append(lines, fmt.Sprintf("%s 装配后没有可上传的结果，跳过上报", stamp()))
+			updateTask(t.ID, func(cur *ScheduleTask) {
+				now := time.Now()
+				cur.LastRun = now.Unix()
+				cur.NextRun = nextRun(cur, now)
+				cur.LastLog = appendLog(cur.LastLog, lines)
+			})
+			return
+		}
 		lines = append(lines, fmt.Sprintf("%s 测速完成，共 %d 个结果，优中选优取前 %d 个上报",
 			stamp(), len(rs), uploadCount(t.Upload.TopN, len(rs))))
 		if t.Upload.GitHub {
@@ -148,7 +198,7 @@ func (s *Scheduler) finishRun(t *ScheduleTask, rs []Result, runErr error) {
 			uctx, uc := context.WithTimeout(context.Background(), 60*time.Second)
 			n, err := s.uploadGitHub(uctx, GitHubTarget{
 				Repo: cfg.GitHubRepo, Token: cfg.GitHubToken, Path: cfg.GitHubPath,
-			}, rs, t.Upload.TopN)
+			}, rs, 0)
 			uc()
 			if err != nil {
 				lines = append(lines, fmt.Sprintf("%s GitHub 上传失败: %v", stamp(), err))
@@ -162,7 +212,7 @@ func (s *Scheduler) finishRun(t *ScheduleTask, rs []Result, runErr error) {
 			s.exec.Log(fmt.Sprintf("定时任务「%s」：上报 Worker…", t.Name))
 			uctx, uc := context.WithTimeout(context.Background(), 60*time.Second)
 			n, err := s.uploadAPI(uctx, APITarget{Domain: cfg.WorkerDomain, UUID: cfg.UUID},
-				rs, t.Upload.TopN, t.Upload.WorkerClear)
+				rs, 0, t.Upload.WorkerClear)
 			uc()
 			if err != nil {
 				lines = append(lines, fmt.Sprintf("%s Worker 上报失败: %v", stamp(), err))
@@ -173,9 +223,9 @@ func (s *Scheduler) finishRun(t *ScheduleTask, rs []Result, runErr error) {
 		}
 	}
 	updateTask(t.ID, func(cur *ScheduleTask) {
-		now := time.Now().Unix()
-		cur.LastRun = now
-		cur.NextRun = now + int64(cur.IntervalMin)*60
+		now := time.Now()
+		cur.LastRun = now.Unix()
+		cur.NextRun = nextRun(cur, now)
 		cur.LastLog = appendLog(cur.LastLog, lines)
 	})
 }
@@ -184,8 +234,8 @@ func (s *Scheduler) finishRun(t *ScheduleTask, rs []Result, runErr error) {
 func (s *Scheduler) logTask(t *ScheduleTask, msg string) {
 	s.exec.Log(fmt.Sprintf("定时任务「%s」：%s", t.Name, msg))
 	updateTask(t.ID, func(cur *ScheduleTask) {
-		now := time.Now().Unix()
-		cur.NextRun = now + int64(cur.IntervalMin)*60
+		now := time.Now()
+		cur.NextRun = nextRun(cur, now)
 		cur.LastLog = appendLog(cur.LastLog, []string{fmt.Sprintf("%s %s", stamp(), msg)})
 	})
 }

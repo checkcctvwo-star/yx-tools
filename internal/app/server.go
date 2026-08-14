@@ -72,6 +72,50 @@ func writeErr(w http.ResponseWriter, code int, msg string) {
 	writeJSON(w, code, map[string]string{"error": msg})
 }
 
+func orEmptyQuotas(q []RegionQuota) []RegionQuota {
+	if q == nil {
+		return []RegionQuota{}
+	}
+	return q
+}
+
+func orEmptyFixed(f []FixedItem) []FixedItem {
+	if f == nil {
+		return []FixedItem{}
+	}
+	return f
+}
+
+// normalizeQuotas 清洗提交的配额：去掉 0 数量、空机场码、重复项
+func normalizeQuotas(q []RegionQuota) []RegionQuota {
+	out := make([]RegionQuota, 0, len(q))
+	seen := map[string]string{} // name -> codes joined
+	for _, r := range q {
+		if r.Count <= 0 || len(r.Colos) == 0 {
+			continue
+		}
+		key := r.Name + "|" + strings.Join(r.Colos, ",")
+		if seen[key] != "" {
+			continue
+		}
+		seen[key] = key
+		out = append(out, RegionQuota{Name: r.Name, Colos: r.Colos, Count: r.Count})
+	}
+	return out
+}
+
+// normalizeFixed 清洗固定附带列表：去掉空地址条目
+func normalizeFixed(f []FixedItem) []FixedItem {
+	out := make([]FixedItem, 0, len(f))
+	for _, it := range f {
+		if strings.TrimSpace(it.Addr) == "" {
+			continue
+		}
+		out = append(out, FixedItem{Addr: strings.TrimSpace(it.Addr), Name: strings.TrimSpace(it.Name)})
+	}
+	return out
+}
+
 func (s *Server) handleColos(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, Colos)
 }
@@ -100,22 +144,32 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			"port":             c.Port,
 			"dl_timeout":       c.DLTimeout,
 			"max_runtime":      c.MaxRunTime,
+			"download_all":     c.DownloadAll,
+			"region_quotas":    orEmptyQuotas(c.RegionQuotas),
+			"other_quota":      c.OtherQuota,
+			"quota_fill":       c.QuotaFill,
+			"fixed_items":      orEmptyFixed(c.FixedItems),
 		})
 	case http.MethodPost:
 		var in struct {
-			WorkerDomain *string  `json:"worker_domain"`
-			UUID         *string  `json:"uuid"`
-			GitHubToken  *string  `json:"github_token"`
-			GitHubRepo   *string  `json:"github_repo"`
-			GitHubPath   *string  `json:"github_path"`
-			Colo         *string  `json:"colo"`
-			IPv6         *bool    `json:"ipv6"`
-			Count        *int     `json:"count"`
-			SpeedLimit   *float64 `json:"speed_limit"`
-			DelayLimit   *int     `json:"delay_limit"`
-			Threads      *int     `json:"threads"`
-			TestURL      *string  `json:"test_url"`
-			Port         *int     `json:"port"`
+			WorkerDomain *string        `json:"worker_domain"`
+			UUID         *string        `json:"uuid"`
+			GitHubToken  *string        `json:"github_token"`
+			GitHubRepo   *string        `json:"github_repo"`
+			GitHubPath   *string        `json:"github_path"`
+			Colo         *string        `json:"colo"`
+			IPv6         *bool          `json:"ipv6"`
+			Count        *int           `json:"count"`
+			SpeedLimit   *float64       `json:"speed_limit"`
+			DelayLimit   *int           `json:"delay_limit"`
+			Threads      *int           `json:"threads"`
+			TestURL      *string        `json:"test_url"`
+			Port         *int           `json:"port"`
+			DownloadAll  *bool          `json:"download_all"`
+			RegionQuotas *[]RegionQuota `json:"region_quotas"`
+			OtherQuota   *int           `json:"other_quota"`
+			QuotaFill    *bool          `json:"quota_fill"`
+			FixedItems   *[]FixedItem   `json:"fixed_items"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&in); err != nil {
 			writeErr(w, http.StatusBadRequest, "请求格式错误")
@@ -161,6 +215,25 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 			if in.Port != nil {
 				cur.Port = *in.Port
 			}
+			if in.DownloadAll != nil {
+				cur.DownloadAll = *in.DownloadAll
+			}
+			if in.RegionQuotas != nil {
+				cur.RegionQuotas = normalizeQuotas(*in.RegionQuotas)
+			}
+			if in.OtherQuota != nil {
+				if *in.OtherQuota < 0 {
+					cur.OtherQuota = 0
+				} else {
+					cur.OtherQuota = *in.OtherQuota
+				}
+			}
+			if in.QuotaFill != nil {
+				cur.QuotaFill = *in.QuotaFill
+			}
+			if in.FixedItems != nil {
+				cur.FixedItems = normalizeFixed(*in.FixedItems)
+			}
 		})
 		if err != nil {
 			writeErr(w, http.StatusInternalServerError, err.Error())
@@ -205,7 +278,7 @@ func (s *Server) handleStart(w http.ResponseWriter, r *http.Request) {
 		c.SpeedLimit, c.DelayLimit, c.Threads = o.SpeedLimit, o.DelayLimit, o.Threads
 		c.TestURL, c.Port = o.TestURL, o.Port
 		c.SampleSize, c.HTTPing, c.DisableDL = o.SampleSize, o.HTTPing, o.DisableDL
-		c.DLTimeout, c.MaxRunTime = o.DLTimeout, o.MaxRunTime
+		c.DLTimeout, c.MaxRunTime, c.DownloadAll = o.DLTimeout, o.MaxRunTime, o.DownloadAll
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -312,15 +385,24 @@ func (s *Server) handleUploadAPI(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 装配：全局配额 + 固定附带列表
+	plan := UploadPlan{
+		Quotas:     c.RegionQuotas,
+		OtherQuota: c.OtherQuota,
+		QuotaFill:  c.QuotaFill,
+		Fixed:      c.FixedItems,
+		Limit:      in.Limit,
+	}
+	rs, warns := BuildUploadList(rs, plan)
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	n, err := UploadToAPI(ctx, APITarget{Domain: in.Domain, UUID: in.UUID}, rs, in.Limit, in.Clear)
+	n, err := UploadToAPI(ctx, APITarget{Domain: in.Domain, UUID: in.UUID}, rs, 0, in.Clear)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	_ = mutateConfig(func(c *Config) { c.WorkerDomain, c.UUID = in.Domain, in.UUID })
-	writeJSON(w, http.StatusOK, map[string]any{"count": n})
+	writeJSON(w, http.StatusOK, map[string]any{"count": n, "warnings": warns})
 }
 
 func (s *Server) handleUploadGitHub(w http.ResponseWriter, r *http.Request) {
@@ -348,9 +430,17 @@ func (s *Server) handleUploadGitHub(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	plan := UploadPlan{
+		Quotas:     c.RegionQuotas,
+		OtherQuota: c.OtherQuota,
+		QuotaFill:  c.QuotaFill,
+		Fixed:      c.FixedItems,
+		Limit:      in.Limit,
+	}
+	rs, warns := BuildUploadList(rs, plan)
 	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
 	defer cancel()
-	n, err := UploadToGitHub(ctx, GitHubTarget{Repo: in.Repo, Token: in.Token, Path: in.Path}, rs, in.Limit)
+	n, err := UploadToGitHub(ctx, GitHubTarget{Repo: in.Repo, Token: in.Token, Path: in.Path}, rs, 0)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
@@ -358,17 +448,21 @@ func (s *Server) handleUploadGitHub(w http.ResponseWriter, r *http.Request) {
 	_ = mutateConfig(func(c *Config) {
 		c.GitHubRepo, c.GitHubToken, c.GitHubPath = in.Repo, in.Token, in.Path
 	})
-	writeJSON(w, http.StatusOK, map[string]any{"count": n})
+	writeJSON(w, http.StatusOK, map[string]any{"count": n, "warnings": warns})
 }
 
 // handleSystem 返回运行环境信息，供界面决定展示哪些功能
 func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
+	now := time.Now()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"cron_supported": CronSupported(),
-		"self_path":      SelfPath(),
-		"result_file":    ResultFile,
-		"proxy_file":     ProxyListFile,
-		"default_url":    DefaultTestURL,
+		"cron_supported":   CronSupported(),
+		"self_path":        SelfPath(),
+		"result_file":      ResultFile,
+		"proxy_file":       ProxyListFile,
+		"default_url":      DefaultTestURL,
+		"server_time":      now.Unix(),
+		"server_tz":        now.Location().String(),
+		"server_time_text": now.Format("15:04"),
 	})
 }
 
@@ -491,6 +585,23 @@ func (s *Server) handleSchedulesList(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, c.Schedules)
 }
 
+// validateScheduleTiming 校验任务的执行时间设置，并就地归一化。
+// daily 模式至少要有一个合法时刻；间隔模式频率至少 1 分钟。
+func validateScheduleTiming(in *ScheduleTask) error {
+	if in.Mode == "daily" {
+		in.Times = validTimePoints(in.Times)
+		if len(in.Times) == 0 {
+			return fmt.Errorf("每天固定时刻至少填一个合法的 HH:MM")
+		}
+		return nil
+	}
+	in.Mode = "" // 非 daily 一律视为间隔模式，保持字段干净
+	if in.IntervalMin < 1 {
+		return fmt.Errorf("执行频率至少 1 分钟")
+	}
+	return nil
+}
+
 // handleScheduleCreate 新建任务：从当前面板复制参数，首次执行等一个周期
 func (s *Server) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 	var in ScheduleTask
@@ -498,14 +609,14 @@ func (s *Server) handleScheduleCreate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "请求格式错误")
 		return
 	}
-	if in.IntervalMin < 1 {
-		writeErr(w, http.StatusBadRequest, "执行频率至少 1 分钟")
+	if err := validateScheduleTiming(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	in.ID = genID()
-	now := time.Now().Unix()
+	now := time.Now()
 	in.LastRun = 0
-	in.NextRun = now + int64(in.IntervalMin)*60
+	in.NextRun = nextRun(&in, now)
 	in.LastLog = fmt.Sprintf("%s 任务已创建", stamp())
 	var out ScheduleTask
 	err := mutateConfig(func(c *Config) {
@@ -532,8 +643,12 @@ func (s *Server) handleScheduleUpdate(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "任务 ID 不匹配")
 		return
 	}
-	if in.IntervalMin < 1 {
+	if in.IntervalMin < 1 && in.Mode != "daily" {
 		writeErr(w, http.StatusBadRequest, "执行频率至少 1 分钟")
+		return
+	}
+	if err := validateScheduleTiming(&in); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	var out ScheduleTask
@@ -545,7 +660,7 @@ func (s *Server) handleScheduleUpdate(w http.ResponseWriter, r *http.Request) {
 			}
 			in.ID = id
 			in.LastRun = c.Schedules[i].LastRun // 编辑不抹掉执行历史
-			in.NextRun = time.Now().Unix() + int64(in.IntervalMin)*60
+			in.NextRun = nextRun(&in, time.Now())
 			normalizeSchedule(&in, i)
 			c.Schedules[i] = in
 			out = in

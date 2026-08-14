@@ -35,11 +35,18 @@ func NewRunner() *Runner {
 	return &Runner{subs: make(map[chan Event]struct{})}
 }
 
-// Subscribe 订阅事件流，返回通道与退订函数；已有历史会先回放
+// Subscribe 订阅事件流，返回通道与退订函数；已有历史会先回放。
+// 回放只取最近与通道等容量的那一段：老实现从最旧开始灌，历史超过通道
+// 容量时末尾的「done/error」终态事件会被挤掉，界面就永远卡在运行态。
+// 从尾部回放保证终态必达，界面据此复位按钮。
 func (r *Runner) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 64)
 	r.mu.Lock()
-	for _, e := range r.history {
+	hist := r.history
+	if len(hist) > cap(ch) {
+		hist = hist[len(hist)-cap(ch):]
+	}
+	for _, e := range hist {
 		select {
 		case ch <- e:
 		default:
